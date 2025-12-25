@@ -139,6 +139,7 @@ class Compartment:
         self.rho = compartment_param["rho"]
         #self.gamma = compartment_param["gamma"]
         self.zeta = compartment_param["zeta"]
+        self.zeta2 = compartment_param["zeta2"]
         self.tau = compartment_param["tau"]
         self.tauw = compartment_param["tauw"]
         self.taub = compartment_param["taub"]
@@ -149,6 +150,11 @@ class Compartment:
         self.rout = compartment_param["rout"]
         self.tauin = compartment_param["tauin"]
         self.tauout = compartment_param["tauout"]
+        #self.cv = compartment_param["cv"]
+        # rate quatile for thresholding high rate events for PV neurons (I-I amplitude controller)
+        self.rq = compartment_param["rq"]
+        self.rt = compartment_param["rt"]
+        self.noise = compartment_param["noise"]
         self.cv = compartment_param["cv"]
         self.eps = compartment_param["eps"]
         self.stype = compartment_param["stype"]
@@ -198,10 +204,11 @@ class Compartment:
         self.CVs_fast = torch.zeros(self.target.nneu).to(self.net.device)
         self.CVs = torch.zeros(self.target.nneu).to(self.net.device)
         
-        self.CV_slow = torch.full((self.target.nneu,),self.cv).to(self.net.device)
-        self.average_slow = torch.full((self.target.nneu,),self.rate_target).to(self.net.device)
+        self.rate_q = torch.full((self.target.nneu,),0.).to(self.net.device)
         self.rate_average = torch.full((self.target.nneu,),self.rate_target).to(self.net.device)
         self.rate_square = torch.full((self.target.nneu,),2*self.rate_target*self.rate_target).to(self.net.device)
+        self.CV_slow = torch.full((self.target.nneu,),self.cv).to(self.net.device)
+        self.fast_average = torch.full((self.target.nneu,),self.rate_target).to(self.net.device)
         '''
         self.E_smooth = torch.full((self.target.nneu,),0.).to(self.net.device)
         self.I_smooth = torch.full((self.target.nneu,),0.).to(self.net.device)
@@ -210,6 +217,10 @@ class Compartment:
         '''
         self.numerator = torch.full((self.target.nneu,),0.).to(self.net.device)
         self.denominator = torch.full((self.target.nneu,),0.).to(self.net.device)
+        self.mu_E = torch.full((self.target.nneu,),0.).to(self.net.device)
+        self.mu_I = torch.full((self.target.nneu,),0.).to(self.net.device)
+        self.mu2_E = torch.full((self.target.nneu,),0.).to(self.net.device)
+        self.mu2_I = torch.full((self.target.nneu,),0.).to(self.net.device)
         self.rate_in = torch.full((self.source.nneu,),self.rate_target).to(self.net.device)
         self.rate_out = torch.full((self.target.nneu,),self.rate_target).to(self.net.device)
         self.band = cp.deepcopy(compartment_param["band"])
@@ -338,14 +349,16 @@ class Compartment:
         
         # update the general averages, while we're at it
         #smoothing(self.rate_square,self.target.rates*self.target.rates,self.taub)
-        if(self.cv>0):
-            smoothing(self.rate_average,self.target.rates,self.taub)
+        if(self.rq>0):
+            smoothing(self.rate_average,self.target.rates,self.tau)
             smoothing(self.rate_square,self.target.rates*self.target.rates,self.taub)
-            smoothing(self.CV_slow,CV(self.rate_average,self.rate_square)*self.rate_average,self.tau)
-            smoothing(self.average_slow,self.rate_average,self.tau)
+            smoothing(self.rate_q,(self.target.rates>self.rt*self.rate_average).float(),self.tau)
         else:
             smoothing(self.rate_average,self.target.rates,self.tau)
-            smoothing(self.rate_square,self.target.rates*self.target.rates,self.tau)
+            smoothing(self.rate_square,self.target.rates*self.target.rates,self.taub)
+            if(self.cv>0):
+                smoothing(self.fast_average,self.target.rates,self.taub)
+                smoothing(self.CV_slow,self.fast_average*torch.clamp(self.rate_square/(self.fast_average*self.fast_average+1e-8)-1,min=0),self.tau)
         smoothing(self.rate_in,self.source.rates,np.abs(self.tauin))
         smoothing(self.rate_out,self.target.rates,np.abs(self.tauout))
 
@@ -405,12 +418,14 @@ class Compartment:
         Ptot = amp["p"]["f"]+amp["p"]["m"]+amp["p"]["s"]+1e-8
 
         # band frequencies dead bands for fast and slow bands
-        Regf1 = amp["p"]["f"]/(Ptot)<amp["theta"]["f"][0]
-        Regf2 = amp["p"]["f"]/(Ptot)>amp["theta"]["f"][1]
-        Regs1 = amp["p"]["s"]/(Ptot)<amp["theta"]["s"][0]
-        Regs2 = amp["p"]["s"]/(Ptot)>amp["theta"]["s"][1]
+        #Regf1 = amp["p"]["f"]/(Ptot)<amp["theta"]["f"][0]
+        #Regf2 = amp["p"]["f"]/(Ptot)>amp["theta"]["f"][1]
+        #Regs1 = amp["p"]["s"]/(Ptot)<amp["theta"]["s"][0]
+        #Regs2 = amp["p"]["s"]/(Ptot)>amp["theta"]["s"][1]
 
-        return Regf1*amp["eta"]["f"][0] - Regf2*amp["eta"]["f"][1] - Regs1*amp["eta"]["s"][0] + Regs2*amp["eta"]["s"][1]
+        #return Regf1*amp["eta"]["f"][0] - Regf2*amp["eta"]["f"][1] - Regs1*amp["eta"]["s"][0] + Regs2*amp["eta"]["s"][1]
+        # ramp to threshold approach for the band regions
+        return torch.clamp(amp["theta"]["f"][0]-amp["p"]["f"]/(Ptot),min=0)*amp["eta"]["f"][0]+torch.clamp(amp["p"]["f"]/(Ptot)-amp["theta"]["f"][1],min=0)*amp["eta"]["f"][1]-torch.clamp(amp["theta"]["s"][0]-amp["p"]["s"]/(Ptot),min=0)*amp["eta"]["s"][0]+torch.clamp(amp["p"]["s"]/(Ptot)+amp["theta"]["s"][1],min=0)*amp["eta"]["s"][1]
 
     def synaptic_band_gain(self):
         post = self.rate_band["synapse"]["out"]
@@ -483,6 +498,20 @@ class Compartment:
         score = self.z_value-self.numerator/(self.denominator+1e-8)
         return score*strong
 
+    def correlation_gain(self):
+        smoothing(self.mu_E,self.target.E_eff,self.taug)
+        smoothing(self.mu_I,self.target.I_eff,self.taug)
+        smoothing(self.mu2_E,self.target.E_eff*self.target.E_eff,self.taug)
+        smoothing(self.mu2_I,self.target.I_eff*self.target.I_eff,self.taug)
+        # NMC is normalized magnitude coupling. It measures co-fluctuations as opposed to correlations (essentially the absolute coupling terms are taken)
+        if(self.ratio=="NMC"):
+            smoothing(self.numerator,torch.abs((self.target.E_eff-self.mu_E)*(self.target.I_eff-self.mu_I)/((torch.sqrt(torch.clamp(self.mu2_E-self.mu_E*self.mu_E,min=0))+1e-8)*(torch.sqrt(torch.clamp(self.mu2_I-self.mu_I*self.mu_I,min=0))+1e-8))),self.taug)
+            return self.numerator-self.z_value
+
+        else:
+            smoothing(self.numerator,(self.target.E_eff-self.mu_E)*(self.target.I_eff-self.mu_I)/((torch.sqrt(torch.clamp(self.mu2_E-self.mu_E*self.mu_E,min=0))+1e-8)*(torch.sqrt(torch.clamp(self.mu2_I-self.mu_I*self.mu_I,min=0))+1e-8)),self.taug)
+            return torch.abs(self.numerator)-self.z_value
+
     def normalize_weights(self):
         self.W._values()[:] = self.w
         self.w/=((self.W@self.ones)[self.w_ind[0,:]]+1e-12)
@@ -536,10 +565,15 @@ class Compartment:
                 
             self.dw+=self.hebb*self.eta
 
+
         
 
         # ltp and ltd adapation for large synapses
         self.dw[:]=self.an[self.w_ind[0,:]]*torch.clamp(self.dw,max=0)*(torch.pow((1+self.k*self.w)*0.5,self.bn))+self.ap[self.w_ind[0,:]]*torch.clamp(self.dw,min=0)*(torch.pow((1+self.k*self.w)*0.5,-self.bp))
+
+        # structure based noise injection. This should be used in cases where the synapse weight distribution has collapsed to all weights being equal.
+        #if(self.noise>0):
+        #    self.dw+=2*self.noise*(torch.rand_like(self.w) - 0.5)*self.w  # uniform noise between [-1, 1]
 
         # L2 regularizer + synapse turnover (because of L1 normalization of weights the form below should have a net zero weight change)
         # that means we use this as a ltp/ltd independent weight distribution regularizer
@@ -589,21 +623,29 @@ class Compartment:
             self.loga+=self.zeta*self.ff_z_score()
         '''
         if(self.zeta!=0):
-            self.loga+=self.zeta*self.compartment_gain()
-        if("amplitude" in self.rate_band):
-            self.loga+=self.amplitude_power()
+            if(self.ratio=="corr" or self.ratio=="NMC"):
+                self.denominator[:] = self.zeta*self.correlation_gain()
+                self.loga+=torch.clamp(self.denominator,min=0)+self.amplitude_power()*(self.denominator<0)
+            else:
+                self.mu_E[:] = self.compartment_gain()
+                self.loga+=self.zeta*torch.clamp(self.mu_E,min=0)+self.zeta2*torch.clamp(self.mu_E,max=0)
+            
+        #if("amplitude" in self.rate_band):
+        #    self.loga+=self.amplitude_power()
         if(self.rho>0):
             self.loga-=self.rho*(self.loga-self.lA0)
             # general leakage term to reduce synapse size; should generally be smaller that any other active (non-balanced) homeostasis terms
             #self.loga-=self.rho
         if(self.delta!=0):
-            if(self.cv>0):
+            if(self.rq>0):
                 # should be positive for excitation
                 #self.loga+=self.delta*(torch.log(np.abs(self.cv)/(CV(self.rate_average,self.rate_square)+1e-8)))
-                self.loga+=self.delta*(self.cv-self.CV_slow/(self.average_slow+1e-8))
+                self.loga+=self.delta*(self.rate_q-self.rq)
             else:
                 #self.loga+=self.delta*torch.log((self.rate_target+1e-6)/(self.rate_average+1e-6))
                 self.loga+=self.delta*torch.log((self.rate_target+1e-6)/(self.rate_average+1e-6))
+                if(self.noise>0):
+                    self.loga+=self.delta*self.noise*(self.cv-self.CV_slow/(self.rate_average+1e-8))
                 #-0.5*torch.log(1+CV(self.rate_average,self.rate_square))
         self.a[:] = torch.exp(self.loga)
 
@@ -748,7 +790,7 @@ rin,rout: firing rates flipping Hebbian learning for (mainly inhibitory) synapse
 delta: amplitude learning rate
 rate_target: target long term firing average for the post synaptic neuron
 '''
-def compartment_parameters(id,source,target,ellipse=[1,1],tsyn=1,A=2,A0=-1,eta=0,etal=0,etar=0,alpha=0,nu=0,beta=0,beta0=0.01,kappa=0,an=1,ap=1,bn=0,bp=0,c_c=None,zeta=0,z_value=0,thetaz=0,ratio="E/I",bands=None,rho=0,tau=0,taug=0,tauw=0,taub=0,taul=0,taur=0,thetar=0,rin=1,rout=1,tauin=1,tauout=1,cv=0,delta=0,rate_target=1,eps=1,stype="",stat=False,power=None,freq=None,SOM=None):
+def compartment_parameters(id,source,target,ellipse=[1,1],tsyn=1,A=2,A0=-1,eta=0,etal=0,etar=0,alpha=0,nu=0,beta=0,beta0=1e-4,kappa=0,an=1,ap=1,bn=0,bp=0,c_c=None,zeta=0,zeta2="",z_value=0,thetaz=0,ratio="E/I",bands=None,rho=0,tau=0,taug=0,tauw=0,taub=0,taul=0,taur=0,thetar=0,rin=1,rout=1,tauin=1,tauout=1,rq=0,rt=1,noise=0,cv=0,delta=0,rate_target=1,eps=1,stype="",stat=False,power=None,freq=None,SOM=None):
     parameters = {}
     parameters["id"] = id
     parameters["source"] = source
@@ -781,6 +823,10 @@ def compartment_parameters(id,source,target,ellipse=[1,1],tsyn=1,A=2,A0=-1,eta=0
     parameters["bp"] = bp
     parameters["kappa"] = kappa
     parameters["zeta"] = zeta
+    if(zeta2==""):
+        parameters["zeta2"] = zeta
+    else:
+        parameters["zeta2"] = zeta2
     parameters["c_c"] = cp.copy(c_c) if c_c is not None else ["",""]
     parameters["delta"] = delta
     parameters["rho"] = rho
@@ -791,6 +837,9 @@ def compartment_parameters(id,source,target,ellipse=[1,1],tsyn=1,A=2,A0=-1,eta=0
     parameters["taul"] = 1./(1+taul)
     parameters["rin"] = rin
     parameters["rout"] = rout
+    parameters["rq"] = rq
+    parameters["rt"] = rt
+    parameters["noise"] = noise
     parameters["cv"] = cv
     parameters["z_value"] = z_value
     parameters["thetaz"] = thetaz

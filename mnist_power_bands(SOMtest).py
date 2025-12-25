@@ -103,14 +103,14 @@ def build_net(
     # --- Global timescales / learning rates ---
     AVG_TAU  = 900             # long-term averages for amplitude, etc.
     TAU_COV = 900              # long-term averages for covariance hebb
-    TAU_BCM = 50               # short term averages for bcm facilitation/supression
+    TAU_BCM = 20               # short term averages for bcm facilitation/supression
     TAUW = 100             # time scale for plasisticity smoothing
     TAU_HOMEO_E = 900        # slow time scale for homeostatic learning of E types
     TAU_HOMEO_I = TAU_HOMEO_E*4      # slow time scale for homeostatic learning of E types
     TAU_SLOW = TAU_HOMEO_I
     TAUL = 3000                # long-term average for LTP/LTD balancing
-    META_E = 0.001/TAUL         # learning rate for meta plasticitcy of LTP/LTD
-    META_I = 0.001/TAUL        
+    META_E = 0.001/TAUL*0         # learning rate for meta plasticitcy of LTP/LTD
+    META_I = 0.001/TAUL*0        
     REG_E = 0.1/TAUL         # learning rate for meta plasticitcy of LTP/LTD
     REG_I = 0.1/TAUL         # learning rate for meta plasticitcy of learning speed beta of regularizer beta*(1/k-wij)
     DELTA_E  = 0.01 / TAU_HOMEO_E  # excitatory amp learning
@@ -123,10 +123,10 @@ def build_net(
     # Base Hebbian LR scale
     BASE  = 0.05 * 0.001*(1+TAUW)  # Base learning rate for synaptic plasticity. This scales with AVG_TAU2 as the smoothing averages over the same timescale
     LR_EE = 1 * BASE
-    LR_EI = 0.5 * BASE
+    LR_EI = 0.2 * BASE
     LR_ES = 0.05 * BASE
-    LR_IE = 0.3 * BASE
-    LR_II = 0.1 * BASE
+    LR_IE = 0.1 * BASE
+    LR_II = 0.05 * BASE
     LR_IS = 0.1 * BASE
     LR_SE = 0.5 * BASE
     LR_SI = -0 * BASE
@@ -201,17 +201,19 @@ def build_net(
     E_E_band["synapse"]["in"]["eta"] = cp.deepcopy(eta_in)
     E_E_band["synapse"]["out"]["eta"] = cp.deepcopy(eta_out)
 
-    # frequency power bands for amplitude learning (I-E)
-    I_E_band = {}
-    I_E_band["amplitude"] = {}
+    # frequency power bands for amplitude learning (I-I)
+    I_I_band = {}
+    I_I_band["amplitude"] = {}
     freq = {"f":7,"m":20,"s":60}
     taup = TAU_SLOW
-    eta = {"f":[4./TAU_SLOW*0.0,2./TAU_SLOW*0.0],"s":[1./TAU_SLOW*0.0,2./TAU_SLOW*0.0]}
-    I_E_band["amplitude"]["target"] = "I_E"
-    I_E_band["amplitude"]["tau"] = cp.copy(freq)
-    I_E_band["amplitude"]["taup"] = taup
-    I_E_band["amplitude"]["theta"] = cp.deepcopy(theta)
-    I_E_band["amplitude"]["eta"] = cp.deepcopy(eta)
+    ETAII = DELTA_E*0.5
+    eta = {"f":[2.*ETAII,4.*ETAII],"s":[2.*ETAII,1.*ETAII]}
+    theta = {"f":[0.3,0.6],"s":[0.2,0.5]}
+    I_I_band["amplitude"]["target"] = "I_I"
+    I_I_band["amplitude"]["tau"] = cp.copy(freq)
+    I_I_band["amplitude"]["taup"] = taup
+    I_I_band["amplitude"]["theta"] = cp.deepcopy(theta)
+    I_I_band["amplitude"]["eta"] = cp.deepcopy(eta)
 
     frequencies = {}
     frequencies["theta"] = {"period": 11, "tau": 16, "alpha": LR_EE/R_E/R_E/3*0}
@@ -236,7 +238,7 @@ def build_net(
         bn=BN_PE,
         bp=BP_PE,
         an=1.,
-        ap=0.75,
+        ap=0.5,
         taul = TAUL,
         etal = META_E,
         etar = REG_E,
@@ -268,16 +270,16 @@ def build_net(
         target="E",
         ellipse=[RAD_E, RAD_E],
         tsyn=50,
-        A=AEE,
-        A0=AEE,
+        A=25,
+        A0=25,
         eta=LR_EE/R_E/R_E/R_E,
-        alpha= 0.0,
+        alpha= 0.,
         nu=0.0,
         beta=BETA_EE,
         bn=BN_EE,
         bp=BP_EE,
         an=1.,
-        ap=0.75,
+        ap=0.5,
         taul = TAUL,
         etal = META_E,
         etar = REG_E,
@@ -293,8 +295,7 @@ def build_net(
         rout=1,
         tauin=TAU_COV,
         tauout=-TAU_COV,
-        taub=TAU_BCM,
-        cv=0,
+        taub=TAU_HOMEO_E,
         zeta=0,
         z_value = 0,
         ratio = "E/I",
@@ -316,15 +317,15 @@ def build_net(
         target="I",
         ellipse=[RAD_I, RAD_I],
         tsyn=50,
-        A=24.5,
-        A0=24.5,
+        A=1.5,
+        A0=1.5,
         eta=LR_EI/R_E/R_I/R_I,
         nu=0.0,
         beta=BETA_EI,
         bn=BN_EI,
         bp=BP_EI,
         an=1,
-        ap=0.75,
+        ap=0.5,
         taul = TAUL,
         etal = META_E,
         etar = REG_E,
@@ -340,10 +341,13 @@ def build_net(
         tauin=TAU_COV,
         tauout=-TAU_COV,
         taub=TAU_BCM,
-        zeta=0,
-        z_value = 0,
-        ratio = "E/I",
+        noise=0,
         cv=0,
+        zeta=DELTA_E*0,
+        z_value = 0.4,
+        ratio = "E/I",
+        rq = 0.05*0,
+        rt=5.,
         delta=DELTA_E*0.4,   # small amplitude plasticity
         rate_target=R_I,
         eps=1.0,
@@ -381,7 +385,6 @@ def build_net(
         zeta=0,
         z_value = 0,
         ratio = "E/I",
-        cv=0,
         delta=DELTA_E*0.1,   # small amplitude plasticity
         rate_target=R_S,
         eps=1.0,
@@ -396,21 +399,21 @@ def build_net(
         target="E",
         ellipse=[RAD_I, RAD_I],
         tsyn=20,
-        A=-40.5,               # inhibitory
-        A0=40.5,               # target amplitude (magnitude)
+        A=-31.,               # inhibitory
+        A0=31.,               # target amplitude (magnitude)
         eta=LR_IE/R_I/R_E,
         nu=0.0,
         beta=BETA_IE,
         bn=BN_IE,
         bp=BP_IE,
         an = 1,
-        ap = 0.9,
+        ap = 0.5,
         taul = TAUL,
         etal = META_I,
         etar = REG_I,
         kappa = KAPPA_IE,
         thetar = THETA_R,
-        bands=I_E_band,
+        bands=None,
         rho=RHO_I,              # you might later add rho for loga regularization
         tau=TAU_HOMEO_E,
         taug=TAU_SLOW,
@@ -420,10 +423,12 @@ def build_net(
         tauin=TAU_COV,
         rout=1,
         tauout=TAU_COV,
-        zeta=-DELTA_E,
+        zeta=-DELTA_E*0.2,
+        zeta2=-DELTA_E*0.4,
         z_value = 0.4,
         ratio = "E/I",
-        cv=0,
+        rq = 0.00,
+        rt=0,
         delta=-DELTA_E*0,        # inhibitory amplitude learning (off now)
         rate_target=R_E,
         eps=1.0,
@@ -437,33 +442,36 @@ def build_net(
         target="I",
         ellipse=[RAD_I, RAD_I],
         tsyn=20,
-        A=-3.0,
-        A0=3.0,
+        A=-0.5,
+        A0=0.5,
         eta=-LR_II/R_I/R_I,
         nu=0.0,
         beta=BETA_II,
         bn=BN_II,
         bp=BP_II,
         an = 1,
-        ap = 0.9,
+        ap = 0.5,
         taul = TAUL,
         etal = META_I,
         etar = REG_I,
         kappa = KAPPA_II,
         thetar = THETA_R,
-        bands=None,
+        bands=I_I_band,
         rho=RHO_I,
         tauw=TAUW,
         tau=TAU_SLOW,
+        taub=TAU_SLOW,
+        taug=TAU_SLOW,
         rin=0,
         tauin=TAU_COV,
         rout= 1,
         tauout=TAU_COV,
-        zeta=-DELTA_E,
-        z_value = 0.6,
-        ratio = "E/I",
-        cv = 0,
-        delta=-DELTA_I*0,
+        zeta=DELTA_E*1,
+        z_value = 0.4,
+        ratio = "corr",
+        rq = 0,
+        rt=5.,
+        delta=-DELTA_E*0,
         rate_target=R_I,
         eps=1.0,
         stype="",
@@ -684,6 +692,23 @@ def log_compartment_stats(net):
                     f"Pm={torch.median(Pm/Ptot):6.3f}  "
                     f"Ps={torch.median(Ps/Ptot):7.4f}  "
                 )
+            if "amplitude" in comp.rate_band:
+
+                Pf = comp.rate_band["amplitude"]["p"]["f"].detach().cpu()
+                Pm = comp.rate_band["amplitude"]["p"]["m"].detach().cpu()
+                Ps = comp.rate_band["amplitude"]["p"]["s"].detach().cpu()
+                Ptot = Pf+Pm+Ps+1e-8
+
+                def safe_mean(x):
+                    x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+                    return float(x.mean().item())
+
+                print(
+                    f"[{pid}:{cid:>4s}] "
+                    f"Pf={torch.median(Pf/Ptot):6.3f}  "
+                    f"Pm={torch.median(Pm/Ptot):6.3f}  "
+                    f"Ps={torch.median(Ps/Ptot):7.4f}  "
+                )
             if comp.SOM!=None:
                 print(
                     f"[{pid}:{cid:>4s}] "
@@ -702,7 +727,12 @@ def log_compartment_stats(net):
             # assuming numerator/denominator exist in your Compartment implementation
             ES = comp.numerator.detach().cpu()
             IS = comp.denominator.detach().cpu()
-            G = torch.mean(ES/(IS+1e-8))
+            if(comp.rq>0):
+                G=torch.mean(comp.rate_q.detach().cpu())
+            elif(comp.ratio=="corr" or comp.ratio=="NMC"):
+                G = torch.mean(comp.numerator)
+            else:
+                G = torch.mean(ES/(IS+1e-8))
             rat = math.exp(-comp.dM.detach().cpu().median())
             Neff = (1/comp.k*row_sum((w<comp.thetar).float(),wind)).mean()
             bfact = math.exp(comp.dN.detach().cpu().median())
