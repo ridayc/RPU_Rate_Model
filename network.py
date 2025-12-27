@@ -135,6 +135,7 @@ class Compartment:
         self.bn = compartment_param["bn"]
         self.bp = compartment_param["bp"]
         self.kappa = compartment_param["kappa"]
+        self.zq = -np.sqrt(2)*erfcinv(2*self.kappa)
         self.delta = compartment_param["delta"]
         self.rho = compartment_param["rho"]
         #self.gamma = compartment_param["gamma"]
@@ -155,7 +156,7 @@ class Compartment:
         self.rq = compartment_param["rq"]
         self.rt = compartment_param["rt"]
         self.noise = compartment_param["noise"]
-        self.cv = compartment_param["cv"]
+        #self.cv = compartment_param["cv"]
         self.eps = compartment_param["eps"]
         self.stype = compartment_param["stype"]
         self.M = 0
@@ -204,11 +205,10 @@ class Compartment:
         self.CVs_fast = torch.zeros(self.target.nneu).to(self.net.device)
         self.CVs = torch.zeros(self.target.nneu).to(self.net.device)
         
-        self.rate_q = torch.full((self.target.nneu,),0.).to(self.net.device)
+        self.wq = torch.full((self.target.nneu,),0.).to(self.net.device)
+        self.cv = torch.full((self.target.nneu,),0.).to(self.net.device)
         self.rate_average = torch.full((self.target.nneu,),self.rate_target).to(self.net.device)
         self.rate_square = torch.full((self.target.nneu,),2*self.rate_target*self.rate_target).to(self.net.device)
-        self.CV_slow = torch.full((self.target.nneu,),self.cv).to(self.net.device)
-        self.fast_average = torch.full((self.target.nneu,),self.rate_target).to(self.net.device)
         '''
         self.E_smooth = torch.full((self.target.nneu,),0.).to(self.net.device)
         self.I_smooth = torch.full((self.target.nneu,),0.).to(self.net.device)
@@ -278,7 +278,7 @@ class Compartment:
         self.eta/=self.k
         self.alpha/=self.k
         self.nu/=self.k
-        self.thetar/=self.k
+        #self.thetar/=self.k
         for k in self.freq:
             self.freq[k]["alpha"] = self.freq[k]["alpha"]/self.k
         self.a = torch.zeros(self.target.nneu).to(self.net.device)
@@ -349,16 +349,13 @@ class Compartment:
         
         # update the general averages, while we're at it
         #smoothing(self.rate_square,self.target.rates*self.target.rates,self.taub)
-        if(self.rq>0):
-            smoothing(self.rate_average,self.target.rates,self.tau)
-            smoothing(self.rate_square,self.target.rates*self.target.rates,self.taub)
-            smoothing(self.rate_q,(self.target.rates>self.rt*self.rate_average).float(),self.tau)
-        else:
-            smoothing(self.rate_average,self.target.rates,self.tau)
-            smoothing(self.rate_square,self.target.rates*self.target.rates,self.taub)
-            if(self.cv>0):
-                smoothing(self.fast_average,self.target.rates,self.taub)
-                smoothing(self.CV_slow,self.fast_average*torch.clamp(self.rate_square/(self.fast_average*self.fast_average+1e-8)-1,min=0),self.tau)
+        #if(self.rq>0):
+        #    smoothing(self.rate_average,self.target.rates,self.tau)
+        #    smoothing(self.rate_square,self.target.rates*self.target.rates,self.taub)
+        #    smoothing(self.rate_q,(self.target.rates>self.rt*self.rate_average).float(),self.tau)
+        #else:
+        smoothing(self.rate_average,self.target.rates,self.tau)
+        smoothing(self.rate_square,self.target.rates*self.target.rates,self.taub)
         smoothing(self.rate_in,self.source.rates,np.abs(self.tauin))
         smoothing(self.rate_out,self.target.rates,np.abs(self.tauout))
 
@@ -589,14 +586,23 @@ class Compartment:
         if(self.etal>0):
             # push an/ap ratio towards balanced ltp/ltd averages over all learning
             smoothing(self.E_dw,row_sum(self.dw-self.w,self.w_ind[0,:]),self.taul)
-            self.dM+=-self.etal*self.E_dw
-            self.ap[:] = torch.exp(self.dM*0.5)
-            self.an[:] = torch.exp(-self.dM*0.5)
+            self.dM+=self.etal*self.E_dw
+            #print(self.E_dw.mean())
+            self.ap[:] = torch.exp(-self.dM*0.5)
+            self.an[:] = torch.exp(self.dM*0.5)
 
         # old idea was based on using synapse sparsity as a comparison measure. We are more explicit here. We say regularization and learning should balance each other out on short timescales (even though the net effect of the regularizer on dw is zero, the important part is the effect it has on weights at the boundary to zero!)
+
+        # different approach. Since we assume log normal, we can estimate the lognormal median from CV and use that as a live threshold. 
         if(self.etar>0):
             # consider smoothing estimate of Neff but should be needed.
-            self.dN+=(1/self.k*row_sum((self.w<self.thetar).float(),self.w_ind[0,:])-self.kappa)*self.etar
+            #self.dN+=(1/self.k*row_sum((self.w<self.thetar).float(),self.w_ind[0,:])-self.kappa)*self.etar
+            # calculate cv^2+1
+            self.cv[:] = row_sum(self.w*self.w,self.w_ind[0,:])*self.k
+            # threshold weight for the kappa quantile
+            self.wq[:] = (1./self.k)/torch.sqrt(self.cv)*torch.exp(torch.sqrt(torch.log(self.cv+1e-8))*self.zq)
+            self.dN[:]+=(-(self.cv<(self.thetar*self.thetar+1)).float()+(self.cv>=(self.thetar*self.thetar+1))*(row_sum((self.w<self.wq[self.w_ind[0,:]]).float(),self.w_ind[0,:])/self.k-(self.kappa+self.rq)))*self.etar
+            
             self.dN.clamp_(min=self.beta0)
 
 
@@ -637,16 +643,16 @@ class Compartment:
             # general leakage term to reduce synapse size; should generally be smaller that any other active (non-balanced) homeostasis terms
             #self.loga-=self.rho
         if(self.delta!=0):
-            if(self.rq>0):
+            #if(self.rq>0):
                 # should be positive for excitation
                 #self.loga+=self.delta*(torch.log(np.abs(self.cv)/(CV(self.rate_average,self.rate_square)+1e-8)))
-                self.loga+=self.delta*(self.rate_q-self.rq)
-            else:
-                #self.loga+=self.delta*torch.log((self.rate_target+1e-6)/(self.rate_average+1e-6))
-                self.loga+=self.delta*torch.log((self.rate_target+1e-6)/(self.rate_average+1e-6))
-                if(self.noise>0):
-                    self.loga+=self.delta*self.noise*(self.cv-self.CV_slow/(self.rate_average+1e-8))
-                #-0.5*torch.log(1+CV(self.rate_average,self.rate_square))
+                #self.loga+=self.delta*(self.rate_q-self.rq)
+            #else:
+            #self.loga+=self.delta*torch.log((self.rate_target+1e-6)/(self.rate_average+1e-6))
+            self.loga+=self.delta*torch.log((self.rate_target+1e-6)/(self.rate_average+1e-6))
+            #if(self.noise>0):
+            #    self.loga+=self.delta*self.noise*(self.cv-self.CV_slow/(self.rate_average+1e-8))
+            #-0.5*torch.log(1+CV(self.rate_average,self.rate_square))
         self.a[:] = torch.exp(self.loga)
 
 def smoothing(tracker,input,tau):

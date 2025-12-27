@@ -109,16 +109,14 @@ def build_net(
     TAU_HOMEO_I = TAU_HOMEO_E*4      # slow time scale for homeostatic learning of E types
     TAU_SLOW = TAU_HOMEO_I
     TAUL = 3000                # long-term average for LTP/LTD balancing
-    META_E = 0.001/TAUL*0         # learning rate for meta plasticitcy of LTP/LTD
-    META_I = 0.001/TAUL*0        
-    REG_E = 0.1/TAUL         # learning rate for meta plasticitcy of LTP/LTD
-    REG_I = 0.1/TAUL         # learning rate for meta plasticitcy of learning speed beta of regularizer beta*(1/k-wij)
+    META_E = 0.01/TAUL         # learning rate for meta plasticitcy of LTP/LTD
+    META_I = 0.1/TAUL       
     DELTA_E  = 0.01 / TAU_HOMEO_E  # excitatory amp learning
     DELTA_I = 0.003 / TAU_HOMEO_I       # inhibitory amp learning (off for now)
     DELTA_S = 0.003 / TAU_HOMEO_I
     RHO      = 0.00 / TAU_HOMEO_I 
-    RHO_E = DELTA_E*0.00
-    RHO_I = DELTA_I*0.00
+    RHO_E = DELTA_E*0.1
+    RHO_I = DELTA_I*0.1
 
     # Base Hebbian LR scale
     BASE  = 0.05 * 0.001*(1+TAUW)  # Base learning rate for synaptic plasticity. This scales with AVG_TAU2 as the smoothing averages over the same timescale
@@ -141,19 +139,25 @@ def build_net(
     BETA_SI = 0*LR_SI
     BETA_SS = 0*LR_SS
 
-    KAPPA_EE = 0.31
-    KAPPA_EI = 0.31
-    KAPPA_ES = 0.2
-    KAPPA_IE = 0.31
-    KAPPA_II = 0.31
-    KAPPA_IS = 0.2
-    KAPPA_SE = 0.25
-    KAPPA_SI = 0.25
-    KAPPA_SS = 0.25
-    # fraction of 1/k (the mean synapse weight) of the compartment synapses must be below to be counted as silent.
-    THETA_R = 0.5
+    # minimal cv for the synapse weight distribution
+    KAPPA_Q = 0.2
+    Q_R = 0.00                       # quantile offset to enable dead synapses
+    REG_E = 0.05/TAUL/KAPPA_Q        # learning rate for meta plasticitcy of LTP/LTD
+    REG_I = 0.05/TAUL/KAPPA_Q          # learning rate for meta plasticitcy of learning speed beta of regularizer beta*(1/k-wij)
+    KAPPA_EE = KAPPA_Q
+    KAPPA_EI = KAPPA_Q
+    KAPPA_ES = KAPPA_Q
+    KAPPA_IE = KAPPA_Q
+    KAPPA_II = KAPPA_Q
+    KAPPA_IS = KAPPA_Q
+    KAPPA_SE = KAPPA_Q
+    KAPPA_SI = KAPPA_Q
+    KAPPA_SS = KAPPA_Q
+    # target fraction of the "dead" synapses that shift the median estimate of a lognormal distribution.
+    # minimal cv value for weight distributions to increase regularization
+    THETA_R = 0.25
 
-    BN_PE = 2
+    BN_PE = 1
     BN_EE = 0.5
     BN_EI = 0.5
     BN_ES = 0
@@ -206,7 +210,7 @@ def build_net(
     I_I_band["amplitude"] = {}
     freq = {"f":7,"m":20,"s":60}
     taup = TAU_SLOW
-    ETAII = DELTA_E*0.5
+    ETAII = DELTA_I*0.5
     eta = {"f":[2.*ETAII,4.*ETAII],"s":[2.*ETAII,1.*ETAII]}
     theta = {"f":[0.3,0.6],"s":[0.2,0.5]}
     I_I_band["amplitude"]["target"] = "I_I"
@@ -240,10 +244,11 @@ def build_net(
         an=1.,
         ap=0.5,
         taul = TAUL,
-        etal = META_E,
+        etal = META_E*100,
         etar = REG_E,
         kappa = KAPPA_EE,
         thetar = THETA_R,
+        rq=Q_R,
         bands=None,
         rho=0,
         tau=TAU_HOMEO_E,
@@ -270,8 +275,8 @@ def build_net(
         target="E",
         ellipse=[RAD_E, RAD_E],
         tsyn=50,
-        A=25,
-        A0=25,
+        A=20,
+        A0=20,
         eta=LR_EE/R_E/R_E/R_E,
         alpha= 0.,
         nu=0.0,
@@ -285,6 +290,7 @@ def build_net(
         etar = REG_E,
         kappa = KAPPA_EE,
         thetar = THETA_R,
+        rq=Q_R,
         bands=E_E_band,
         freq=frequencies,
         rho=RHO_E,
@@ -317,8 +323,8 @@ def build_net(
         target="I",
         ellipse=[RAD_I, RAD_I],
         tsyn=50,
-        A=1.5,
-        A0=1.5,
+        A=10,
+        A0=10,
         eta=LR_EI/R_E/R_I/R_I,
         nu=0.0,
         beta=BETA_EI,
@@ -331,8 +337,9 @@ def build_net(
         etar = REG_E,
         kappa = KAPPA_EI,
         thetar = THETA_R,
+        rq=Q_R,
         bands=None,
-        rho=RHO_E*0.1,
+        rho=RHO_E*0.,
         tau=TAU_HOMEO_E,
         tauw=TAUW,
         taug=TAU_SLOW,
@@ -346,8 +353,6 @@ def build_net(
         zeta=DELTA_E*0,
         z_value = 0.4,
         ratio = "E/I",
-        rq = 0.05*0,
-        rt=5.,
         delta=DELTA_E*0.4,   # small amplitude plasticity
         rate_target=R_I,
         eps=1.0,
@@ -372,6 +377,7 @@ def build_net(
         etal = META_E,
         kappa = KAPPA_ES,
         thetar = THETA_R,
+        rq=Q_R,
         bands=None,
         rho=RHO_E*0.00,
         tau=TAU_HOMEO_E,
@@ -399,9 +405,9 @@ def build_net(
         target="E",
         ellipse=[RAD_I, RAD_I],
         tsyn=20,
-        A=-31.,               # inhibitory
-        A0=31.,               # target amplitude (magnitude)
-        eta=LR_IE/R_I/R_E,
+        A=-10.,               # inhibitory
+        A0=10.,               # target amplitude (magnitude)
+        eta=LR_IE/R_I/R_E/R_E,
         nu=0.0,
         beta=BETA_IE,
         bn=BN_IE,
@@ -409,26 +415,25 @@ def build_net(
         an = 1,
         ap = 0.5,
         taul = TAUL,
-        etal = META_I,
+        etal = META_I*10,
         etar = REG_I,
         kappa = KAPPA_IE,
         thetar = THETA_R,
+        rq=Q_R,
         bands=None,
-        rho=RHO_I,              # you might later add rho for loga regularization
+        rho=0,              # you might later add rho for loga regularization
         tau=TAU_HOMEO_E,
         taug=TAU_SLOW,
         tauw=TAUW,
         taub=TAU_BCM,
-        rin=0,
+        rin=1,
         tauin=TAU_COV,
         rout=1,
-        tauout=TAU_COV,
-        zeta=-DELTA_E*0.2,
-        zeta2=-DELTA_E*0.4,
+        tauout=-TAU_COV,
+        zeta=-DELTA_I*2,
+        zeta2=-DELTA_I*4,
         z_value = 0.4,
         ratio = "E/I",
-        rq = 0.00,
-        rt=0,
         delta=-DELTA_E*0,        # inhibitory amplitude learning (off now)
         rate_target=R_E,
         eps=1.0,
@@ -442,9 +447,9 @@ def build_net(
         target="I",
         ellipse=[RAD_I, RAD_I],
         tsyn=20,
-        A=-0.5,
-        A0=0.5,
-        eta=-LR_II/R_I/R_I,
+        A=-10,
+        A0=10,
+        eta=LR_II/R_I/R_I/R_I,
         nu=0.0,
         beta=BETA_II,
         bn=BN_II,
@@ -452,25 +457,24 @@ def build_net(
         an = 1,
         ap = 0.5,
         taul = TAUL,
-        etal = META_I,
+        etal = META_I*10,
         etar = REG_I,
         kappa = KAPPA_II,
         thetar = THETA_R,
+        rq=Q_R,
         bands=I_I_band,
-        rho=RHO_I,
+        rho=RHO_I*0.1,
         tauw=TAUW,
         tau=TAU_SLOW,
         taub=TAU_SLOW,
         taug=TAU_SLOW,
-        rin=0,
+        rin=1,
         tauin=TAU_COV,
         rout= 1,
-        tauout=TAU_COV,
-        zeta=DELTA_E*1,
+        tauout=-TAU_COV,
+        zeta=DELTA_I*0.3,
         z_value = 0.4,
         ratio = "corr",
-        rq = 0,
-        rt=5.,
         delta=-DELTA_E*0,
         rate_target=R_I,
         eps=1.0,
@@ -491,6 +495,7 @@ def build_net(
         beta=BETA_IS,
         kappa = KAPPA_IS,
         thetar = THETA_R,
+        rq=Q_R,
         bands=None,
         rho=RHO_I,              # you might later add rho for loga regularization
         tau=TAU_SLOW,
@@ -529,6 +534,7 @@ def build_net(
         etal = META_I,
         kappa = KAPPA_SE,
         thetar = THETA_R,
+        rq=Q_R,
         bands=None,
         rho=RHO_I*0,              # you might later add rho for loga regularization
         tau=TAU_SLOW,
@@ -562,6 +568,7 @@ def build_net(
         beta=BETA_SI,
         kappa = KAPPA_SI,
         thetar = THETA_R,
+        rq=Q_R,
         bands=None,
         rho=RHO_I,              # you might later add rho for loga regularization
         tau=TAU_SLOW,
@@ -594,6 +601,7 @@ def build_net(
         beta=BETA_SS,
         kappa = KAPPA_SS,
         thetar = THETA_R,
+        rq=Q_R,
         bands=None,
         rho=RHO_I,              # you might later add rho for loga regularization
         tau=TAU_SLOW,
@@ -724,17 +732,17 @@ def log_compartment_stats(net):
             a = comp.a.detach().cpu()
             w = comp.w.detach().cpu()
             wind = comp.w_ind[0,:].detach().cpu()
+            wq = comp.wq.detach().cpu()
             # assuming numerator/denominator exist in your Compartment implementation
             ES = comp.numerator.detach().cpu()
             IS = comp.denominator.detach().cpu()
-            if(comp.rq>0):
-                G=torch.mean(comp.rate_q.detach().cpu())
-            elif(comp.ratio=="corr" or comp.ratio=="NMC"):
+            if(comp.ratio=="corr" or comp.ratio=="NMC"):
                 G = torch.mean(comp.numerator)
             else:
                 G = torch.mean(ES/(IS+1e-8))
             rat = math.exp(-comp.dM.detach().cpu().median())
-            Neff = (1/comp.k*row_sum((w<comp.thetar).float(),wind)).mean()
+            Neff = (1/comp.k*row_sum((w<wq[wind]).float(),wind)).mean()
+            #Neff = (1/comp.k*row_sum((w<comp.thetar).float(),wind)).mean()
             bfact = math.exp(comp.dN.detach().cpu().median())
             
             mean_a = a.mean().item()
