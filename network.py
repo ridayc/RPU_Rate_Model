@@ -422,7 +422,7 @@ class Compartment:
 
         #return Regf1*amp["eta"]["f"][0] - Regf2*amp["eta"]["f"][1] - Regs1*amp["eta"]["s"][0] + Regs2*amp["eta"]["s"][1]
         # ramp to threshold approach for the band regions
-        return torch.clamp(amp["theta"]["f"][0]-amp["p"]["f"]/(Ptot),min=0)*amp["eta"]["f"][0]+torch.clamp(amp["p"]["f"]/(Ptot)-amp["theta"]["f"][1],min=0)*amp["eta"]["f"][1]-torch.clamp(amp["theta"]["s"][0]-amp["p"]["s"]/(Ptot),min=0)*amp["eta"]["s"][0]+torch.clamp(amp["p"]["s"]/(Ptot)+amp["theta"]["s"][1],min=0)*amp["eta"]["s"][1]
+        return torch.clamp(amp["theta"]["f"][0]-amp["p"]["f"]/(Ptot),min=0)*amp["eta"]["f"][0]-torch.clamp(amp["p"]["f"]/(Ptot)-amp["theta"]["f"][1],min=0)*amp["eta"]["f"][1]-torch.clamp(amp["theta"]["s"][0]-amp["p"]["s"]/(Ptot),min=0)*amp["eta"]["s"][0]+torch.clamp(amp["p"]["s"]/(Ptot)-amp["theta"]["s"][1],min=0)*amp["eta"]["s"][1]
 
     def synaptic_band_gain(self):
         post = self.rate_band["synapse"]["out"]

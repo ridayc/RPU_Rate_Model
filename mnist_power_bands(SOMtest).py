@@ -210,9 +210,9 @@ def build_net(
     I_I_band["amplitude"] = {}
     freq = {"f":7,"m":20,"s":60}
     taup = TAU_SLOW
-    ETAII = DELTA_I*0.5
-    eta = {"f":[2.*ETAII,4.*ETAII],"s":[2.*ETAII,1.*ETAII]}
-    theta = {"f":[0.3,0.6],"s":[0.2,0.5]}
+    ETAII = DELTA_I*10
+    eta = {"f":[1.*ETAII,1.*ETAII],"s":[1.*ETAII,1.*ETAII]}
+    theta = {"f":[0.5,0.7],"s":[0.2,0.5]}
     I_I_band["amplitude"]["target"] = "I_I"
     I_I_band["amplitude"]["tau"] = cp.copy(freq)
     I_I_band["amplitude"]["taup"] = taup
