@@ -1,0 +1,1242 @@
+\documentclass[11pt, a4paper]{article}
+
+% --- Packages ---
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{natbib}
+\usepackage{geometry}
+\usepackage{lineno}
+\usepackage{setspace}
+\usepackage{booktabs}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{float}
+\usepackage{natbib}
+
+% --- Page geometry ---
+\geometry{
+	a4paper,
+	left=25mm,
+	right=25mm,
+	top=25mm,
+	bottom=25mm
+}
+
+% --- Line spacing (double for review, single for final) ---
+\onehalfspacing
+
+% --- Line numbers (standard for preprints) ---
+\linenumbers
+
+% --- Hyperlink styling ---
+\hypersetup{
+	colorlinks=true,
+	linkcolor=blue!60!black,
+	citecolor=blue!60!black,
+	urlcolor=blue!60!black
+}
+
+% --- Custom commands ---
+\newcommand{\norm}[1]{\left\lVert#1\right\rVert}
+\newcommand{\eg}{e.g.,\ }
+\newcommand{\ie}{i.e.,\ }
+
+% ================================================================
+\begin{document}
+	% ================================================================
+	
+	% --- Title block ---
+	\begin{titlepage}
+		\centering
+		\vspace*{2cm}
+		
+		{\LARGE \bfseries
+			A Biologically Constrained Recurrent Network with Local Learning Rules:\\
+			Stable Population Dynamics, Representational Drift,\\
+			and Emergent Feedforward Organization
+			\par}
+		
+		\vspace{1.5cm}
+		
+		{\large
+			Cosimo Riday$^{1}$
+			\par}
+		
+		\vspace{0.8cm}
+		
+		{\normalsize
+			$^{1}$ Independent Researcher, Zurich, Switzerland \\
+			\par}
+		
+		\vspace{0.5cm}
+		
+		{\normalsize
+			Correspondence: \href{ridayc@proton.me}{ridayc@proton.me}
+			\par}
+		
+		\vspace{1.5cm}
+		
+		{\normalsize \today \par}
+		
+		\vspace{2cm}
+		
+		% --- Short abstract for title page ---
+		\begin{minipage}{0.85\textwidth}
+			\textbf{Keywords:} biologically plausible learning, recurrent neural networks,
+			synaptic scaling, representational drift, local learning rules,
+			inhibitory plasticity, geometric connectivity, neuromorphic computing
+		\end{minipage}
+		
+	\end{titlepage}
+	
+	% ================================================================
+	% ABSTRACT
+	% ================================================================
+	\newpage
+	\begin{abstract}
+		\noindent
+		% Suggested structure:
+		% 1-2 sentences: the problem and why it is hard
+		% 2-3 sentences: what you did and the key constraints
+		% 2-3 sentences: what you found
+		% 1-2 sentences: why it matters
+		
+		This paper presents a recurrent neural network model governed by a set of
+		strictly local, biologically motivated learning rules and architectural
+		constraints. Unlike most existing models, all synaptic weights ---
+		including inhibitory connections --- are learned through rules that
+		depend only on information locally available at the synapse. Operating
+		under geometric two-dimensional connectivity with a depth axis, Dale's
+		law, and a timescale hierarchy of plasticity mechanisms grounded in
+		control theory, the network achieves stable population-wide firing rate
+		statistics without convergence to a fixed point. Individual neurons
+		exhibit continuous representational drift while population statistics
+		remain bounded --- consistent with recent experimental observations of
+		representational drift in cortex. Feedforward weights spontaneously
+		develop spatially localized, orientation-selective receptive fields
+		without oriented structure in the input, while recurrent weights don't exhibit obvious geometric
+		structuring. Synaptic weight distributions emerge as lognormal across
+		all synapse types. The model exhibits broad robustness to initialization
+		across a wide range of L1 norm values. We discuss the biological
+		interpretation of the learning rules, their relationship to synaptic
+		scaling, metabolic constraints, and silent synapse dynamics, and
+		identify potential links to neuromorphic implementations.
+		
+	\end{abstract}
+	
+	% ================================================================
+	% 1. INTRODUCTION
+	% ================================================================
+	\newpage
+	\section{Introduction}
+	
+	% Suggested flow:
+	% - The problem: stable recurrent learning under biological constraints
+	% - What is typically assumed/cheated in existing models
+	% - Your approach: take constraints seriously
+	% - Brief summary of results
+	% - Roadmap of paper
+	
+	The neocortex solves a remarkable engineering problem: it learns
+	continuously, maintains stable representations, and reorganizes itself
+	--- all using only local information at each synapse, with no access to
+	global error signals or centralized coordination. Reproducing this
+	capacity in computational models has proven difficult. Most existing
+	approaches either relax the constraint of locality
+	\citep{placeholder1}, fix inhibitory weights
+	\citep{placeholder2}, require careful initialization
+	\citep{placeholder3}, or impose explicit convergence mechanisms
+	that have no clear biological counterpart \citep{placeholder4}.
+	
+	Recent experimental work has complicated the picture further by
+	demonstrating that neural representations in cortex drift continuously
+	even in stable environments --- a phenomenon termed representational
+	drift \citep{placeholder5}. This suggests that convergence to a fixed
+	point is not the goal of biological learning, and that stability is a
+	statistical property of the population rather than of individual
+	neurons.
+	
+	Here we present a model that takes biological constraints seriously at
+	every level of design. We impose strict locality throughout: no synapse
+	has access to information beyond its own weight, the firing rates of
+	its pre- and postsynaptic neurons, and local statistics derived from
+	these. We enforce Dale's law, geometric connectivity, and a timescale
+	hierarchy of plasticity mechanisms motivated by the biological
+	literature. We learn inhibitory weights using the same local framework
+	as excitatory weights.
+	
+	Under these constraints, we find that the network exhibits stable
+	population firing rate statistics without individual convergence,
+	spontaneous development of spatially organized feedforward receptive
+	fields, orientation-like selectivity without oriented input, lognormal
+	weight distributions, and broad robustness to initialization. We argue
+	that these properties emerge as natural consequences of the constraints
+	rather than as designed outcomes.
+	
+	The paper is organized as follows. Section~\ref{sec:model} describes
+	the network architecture. Section~\ref{sec:learning} presents the
+	learning rules and their biological motivation. Section~\ref{sec:results}
+	reports the results. Section~\ref{sec:discussion} discusses the
+	relationship to biology, existing models, and potential applications.
+	
+	% ================================================================
+	% 2. MODEL
+	% ================================================================
+	\section{Methods}
+	\label{sec:model}
+	
+	\subsection{Biological Constraints and Design Principles}
+	
+	The present framework is motivated by the observation that cortical circuits operate under multiple simultaneous functional and biological constraints. 
+	Neural systems must maintain stable activity, preserve excitation--inhibition balance, adapt continuously to changing inputs, regulate metabolic and structural resources, and avoid pathological synchronization or runaway plasticity. \citep{turrigiano2004}\citep{turrigiano2012}
+	These requirements are not governed by a single experimentally established global optimization principle. \citep{marblestone2016}
+	Instead, experimental and theoretical studies suggest that cortical stability and adaptability emerge from the interaction of many local regulatory processes acting across distinct pathways and timescales. \citep{zenke2017}
+	
+	Accordingly, the model is constructed as a modular system of interacting local control mechanisms. 
+	Each mechanism addresses a specific functional constraint associated with recurrent adaptive dynamics, while remaining compatible with biologically plausible locality assumptions. 
+	In particular, all synaptic updates depend only on locally available quantities, including pre- and postsynaptic activity, current synaptic strength, and statistics derived from synapses in the same dendritic compartment of the same neuron, or from the whole neuron. 
+	No global error signals, gradient transport, or externally imposed optimization objectives are used.
+	The objective of the model is not to reproduce biological detail at the microscopic level, but to abstract a set of functional constraints believed to contribute to stable cortical adaptation.
+	
+	\vspace{0.5em}
+	\noindent
+	\textbf{Recurrent-dominant dynamical regime.}
+	The model operates in a regime characterized by strong local recurrent connectivity relative to feedforward drive. 
+	In this setting, neural activity is primarily shaped by internally generated recurrent dynamics, while external inputs act as structured perturbations that modulate and steer ongoing activity rather than fully determining it. 
+	This regime is motivated by the organization of cortical microcircuits, where dense local recurrence and strong lateral interactions coexist with comparatively sparse and spatially constrained long-range inputs. 
+	As a consequence, stability, selectivity, and representational structure must be maintained primarily through recurrent interactions rather than feedforward dominance. 
+	This architectural bias significantly amplifies the sensitivity of the system to feedback-driven instabilities, including amplification of correlated activity, emergence of dominant recurrent loops, and self-reinforcing activity patterns, thereby motivating the need for continuous local regulatory mechanisms.
+	
+	
+	\vspace{0.5em}
+	\noindent
+	\textbf{Nonlinear neuronal transfer functions.}
+	Neurons are modeled using rectified polynomial activation functions (RePU), allowing both sublinear and superlinear input-output transformations. 
+	In particular, larger polynomial exponents in inhibitory populations increase suppressive efficacy at high activity levels, facilitating stable excitation--inhibition balance without requiring explicit lateral inhibition mechanisms. (self note: it is useful to cite biology having similar non linear exponents which differ between excitation and inhibition)
+	This nonlinearity is expected to support stable recurrent dynamics across a broader range of activity amplitudes than from ReLU units.
+	
+	
+	\vspace{0.5em}
+	\noindent
+	\textbf{Activity-dependent synaptic plasticity.}
+	Experimental studies indicate that long-term synaptic modification depends strongly on correlated pre- and postsynaptic activity, as observed in Hebbian plasticity and spike-timing dependent plasticity (STDP). 
+	At the same time, synaptic modification is gated by postsynaptic activation state, such that inactive neurons exhibit little or no effective plasticity. 
+	The present framework therefore employs covariance-based local learning rules modulated by neuronal activity, enabling adaptive correlation learning while preserving locality. (self note: minimal citations needed, generally very accepted)
+	
+	\vspace{0.5em}
+	\noindent
+	\textbf{Weight-dependent potentiation and depression.}
+	Biological synapses exhibit non-uniform plasticity across synaptic strengths. 
+	Strong synapses are generally more stable and less susceptible to potentiation, while weaker synapses remain more labile. Simultaneously, strong synapses are more susceptible to depression. 
+	Such weight dependence has been observed experimentally and is believed to contribute to synaptic stability and long-term memory retention. (self note: citations needed)
+	The model incorporates this principle through asymmetric weight-dependent modulation of long-term potentiation (LTP) and long-term depression (LTD), suppressing runaway growth while preserving adaptive flexibility.
+	
+	\vspace{0.5em}
+	\noindent
+	\textbf{Finite synaptic resources and competitive normalization.}
+	Cortical neurons operate under substantial metabolic, structural, and spatial constraints. 
+	Synapses compete for limited cellular resources including receptor availability, protein synthesis, dendritic space, and energetic support. (self note: citations needed)
+	Motivated by these constraints, synaptic weights within each compartment are normalized to a fixed total synaptic mass. 
+	This induces competition between synapses and transforms synaptic strengthening into a redistributive process rather than unconstrained additive growth.
+	
+	\vspace{0.5em}
+	\noindent
+	\textbf{Homeostatic regulation of synaptic distributions.}
+	Experimental observations suggest that cortical synaptic strengths often exhibit broad, approximately log-normal distributions rather than uniform or narrowly concentrated configurations. 
+	At the same time, excessive concentration of synaptic strength onto a small subset of synapses may destabilize recurrent dynamics and reduce representational diversity. (self note: here modeling based citations are needed for such observations, as biology has mostly already solved this problem) 
+	The framework therefore includes a local distributional control mechanism that regulates the shape of synaptic weight distributions while preventing collapse toward either highly concentrated or fully uniform states.
+	
+	\vspace{0.5em}
+	\noindent
+	\textbf{Firing-rate homeostasis and excitation--inhibition balance.}
+	Neural circuits maintain activity within stable operating regimes despite ongoing synaptic plasticity and fluctuating inputs. 
+	Homeostatic regulation of firing rates and excitation--inhibition balance has been widely observed experimentally and is believed to play a central role in preventing runaway excitation, quiescence, and dynamical instability. (self note: strong claims require citations. These here need to be biological)
+	The present model incorporates slow compartment-specific scaling mechanisms that regulate firing rates, relative pathway contributions, and recurrent balance.
+	
+	\vspace{0.5em}
+	\noindent
+	\textbf{Inhibitory regulation of network dynamics.}
+	Inhibitory interneuron circuits are strongly implicated in the regulation of synchrony, gain control, oscillatory activity, and temporal coordination in cortex. 
+	In particular, inhibitory connectivity contributes not only to balancing excitation, but also to controlling higher-order dynamical properties of recurrent activity. (self note: again biological citations needed)
+	Motivated by these observations, inhibitory pathways in the model are assigned specialized regulatory roles including decorrelation and spectral stabilization of network activity.
+	
+	\vspace{0.5em}
+	\noindent
+	\textbf{Spatial locality and structured connectivity.}
+	Cortical connectivity exhibits strong spatial organization, with connection probability generally decreasing with distance and local recurrent motifs dominating cortical microcircuits. (self note: maybe a single citation, this is fairly well known)
+	To reflect this organization, neurons are embedded in a spatially structured architecture with predominantly local connectivity. 
+	This supports the emergence of localized receptive fields, topographic organization, and spatially structured recurrent dynamics.
+	Excitatory projections commonly extend over larger spatial ranges than inhibitory projections. The model does not employ hard-coded lateral inhibition. Instead, inhibitory regulation emerges through locally learned recurrent inhibitory connectivity, consistent with the predominantly short-range structure of cortical inhibitory projections. (self note: biological citations needed here)
+	
+	\vspace{0.5em}
+	\noindent
+	\textbf{Timescale separation and modular control.}
+	Biological plasticity mechanisms operate across multiple timescales, ranging from rapid synaptic modifications to slow homeostatic and structural processes. (self note: citations are nice here, as this should be emphasized)
+	The framework therefore separates fast correlation-based learning from slower normalization, homeostatic regulation, and dynamical control mechanisms. 
+	This hierarchical organization improves robustness and allows partially independent stabilization of distinct dynamical modes.
+	
+	\vspace{0.5em}
+	\noindent
+	Taken together, the model should be interpreted as a control-theoretic abstraction of recurrent cortical adaptation. 
+	Rather than optimizing a single global objective function, the framework investigates whether stable and structured learning dynamics can emerge from the interaction of multiple biologically motivated local constraints and regulatory processes.
+	
+	\subsection{Recurrent Failure Modes and Modular Constraint Decomposition}
+	
+	Recurrently connected adaptive neural systems operating in a recurrent-dominant regime with local plasticity are subject to a wide range of dynamical and structural instabilities. 
+	In such systems, network activity is primarily shaped by internally generated feedback loops rather than feedforward drive, and synaptic updates depend only on locally available signals without global error correction. 
+	As a consequence, even simple local learning rules can give rise to emergent instability when embedded in strongly recurrent excitatory--inhibitory architectures. 
+	These instabilities arise from the interaction between feedback amplification, competition induced by normalization constraints, and multi-timescale plastic adaptation. 
+	
+	In biological systems, analogous instabilities are believed to be mitigated through the coordinated action of multiple local regulatory mechanisms. 
+	The present framework is therefore organized around the principle that distinct instability classes in recurrent-dominant adaptive systems should be addressed through partially separable control processes.
+	
+	\vspace{0.5em}
+	\noindent
+	\textbf{Synaptic monopolization and loss of representational diversity.}
+	In strongly recurrent systems with competitive normalization, synaptic updates are repeatedly re-exposed to internally amplified activity patterns. 
+	This leads to reinforcement of already dominant recurrent pathways, which can progressively concentrate synaptic strength onto a small subset of connections. 
+	In the recurrent-dominant regime, this effect is amplified because internal dynamics rather than external inputs determine the correlation structure that drives learning. 
+	As a result, synaptic competition may collapse into a small number of dominant recurrent motifs, reducing the diversity of stable activity configurations. 
+	The model counteracts this through L1 normalization and explicit regulation of synaptic weight distributions.
+	
+	\vspace{0.5em}
+	\noindent
+	\textbf{Excitation--inhibition imbalance.}
+	In recurrent-dominant architectures, excitation and inhibition co-evolve under plasticity driven by internally generated activity patterns. 
+	Because both excitatory and inhibitory pathways are shaped by the same recurrent dynamics, small imbalances can be amplified through feedback loops rather than corrected by external input. 
+	This can result in drift toward regimes of quiescence, excessive excitation, or unstable oscillatory activity. 
+	To mitigate this, the framework incorporates pathway-specific scaling mechanisms and nonlinear inhibitory responses that regulate effective input contributions over time.
+	
+	\vspace{0.5em}
+	\noindent
+	\textbf{Pathological synchronization and correlation collapse.}
+	Strong local recurrence naturally supports the formation of highly correlated activity states, in which subsets of neurons become mutually reinforcing through feedback connections. 
+	In the recurrent-dominant regime, these correlations are further reinforced by plasticity, since internally generated synchrony directly drives synaptic modification. 
+	This can reduce the effective dimensionality of network activity and suppress weaker dynamical modes. 
+	The model addresses this via inhibitory mechanisms that regulate correlation structure and suppress excessive synchrony.
+	
+	\vspace{0.5em}
+	\noindent
+	\textbf{Oscillatory and spectral instabilities.}
+	Recurrent-dominant systems with multi-timescale feedback often exhibit structured temporal dynamics, including oscillatory modes and slow recurrent cycles. 
+	When plasticity and recurrent feedback interact across multiple timescales, certain temporal frequency bands may become disproportionately reinforced, leading to dominance of specific dynamical regimes. 
+	In the present framework, this tendency is regulated through multi-timescale inhibitory control signals that modulate recurrent activity based on spectral statistics of network dynamics.
+	
+	\vspace{0.5em}
+	\noindent
+	\textbf{Drift and long-timescale instability.}
+	Even when short-timescale dynamics remain stable, recurrent plastic systems may exhibit slow drift due to persistent asymmetries in potentiation and depression. 
+	In recurrent-dominant regimes, such drift is reinforced by the fact that synaptic updates are driven primarily by internally generated activity statistics, which themselves evolve under the influence of prior plastic changes. 
+	Over long timescales this can bias synaptic distributions and alter network operating points. 
+	The framework compensates for this via slow integral regulation of LTP and LTD balance.
+	
+	\vspace{0.5em}
+	\noindent
+	\textbf{Controller interference across timescales.}
+	When multiple adaptive processes operate simultaneously in recurrent systems, interactions between mechanisms can themselves become a source of instability. 
+	This is particularly relevant in recurrent-dominant architectures, where the same internal activity patterns drive multiple plasticity and normalization processes across different timescales. 
+	Without sufficient separation, fast adaptive mechanisms may suppress slower stabilization processes or amplify transient dynamics. 
+	The framework therefore explicitly separates fast correlation-based learning from slower homeostatic and normalization dynamics.
+	
+	\vspace{0.5em}
+	\noindent
+	Taken together, these observations motivate a modular decomposition of recurrent adaptive stabilization into multiple interacting local mechanisms. 
+	Rather than assuming that a single learning rule or objective function can simultaneously resolve all instability modes, the framework treats recurrent adaptation as a distributed constraint-satisfaction process in which distinct instability mechanisms emerge from the structure of recurrent-dominant local learning dynamics.
+	
+	
+	
+	\subsection{Neuron Model}
+	% Describe rectified polynomial units
+	% Firing rate formulation
+	% Input-output relationship
+	
+	Neurons are modeled as compartmentalized leaky rate units with rectified, capped polynomial (RePU) activation
+	function. 
+	The activation $u_i$ of neuron $i$ from the population $n$ at time $t+1$ is
+	
+	\begin{equation}
+		u_i[t+1] = r_{0i}^{1-p}\left(\left[ \sum_k A_k \sum_{j \in k} w_{ij} r_j[t] \right]_+^{c_i}\right)^p
+		\label{eq:neuron_activation}
+	\end{equation}
+	
+	where:
+	\begin{itemize}
+		\item $w_{ij}$ is the L1-normalized synaptic weight from neuron $j$ to neuron $i$,
+		\item $A_k$ scales the contribution of inputs from compartment $k$,
+		\item $r_j[t]$ is the presynaptic firing rate at the previous timestep,
+		\item $[\cdot]_+^{c_n} = \min(\max(0,\cdot),c_n)$ denotes rectification with an upper cap $c_n$,
+		\item $p_n \in \mathbb{R}^+$ is the polynomial exponent, and
+		\item $r_{0n}$ is a reference rate for normalization.
+	\end{itemize}
+	
+	The neuron's firing rate is updated via a first-order leaky integration, which can equivalently be expressed as an exponential moving average (EMA) of the activation:
+	
+	\begin{equation}
+		r_i[t+1] = EMA(r_i[t], u_i[t+1], \alpha_n)
+		\label{eq:neuron_rate}
+	\end{equation}
+	
+	Here, the EMA is defined as
+	
+	\begin{equation}
+		EMA(x, y, a) = (1-a)\, x + a\, y
+		\label{eq:EMA}
+	\end{equation}
+	
+	$\alpha_n = \frac{1}{1+\tau_n}$ controls the update stiffness and $\tau_n$ is the effective integration timescale of neuron $i$.
+	
+	This formulation produces non-negative, bounded outputs with smooth, tunable nonlinearities. 
+	The reference rate $r_{0i}$ sets a scale-free operating point, allowing consistent activations across heterogeneous neurons, 
+	while the fractional polynomial exponent $p$ permits sub- or superlinear responses. 
+	Compartmental scaling $A_k$ allows both dendritic-like input integration and differential weighting of inputs from distinct populations, 
+	including feedforward, excitatory, and inhibitory sources, and could support layer-specific processing in future extensions. 
+	Neuron-specific parameters ($\alpha_i, r_{0i}, c_i$) allow diverse temporal dynamics and firing ranges across populations, 
+	which collectively support stable, structured recurrent activity.
+	
+	
+	
+	
+	\subsection{Network Architecture}
+	
+	% 2D spatial layout
+	% Depth axis (stack)
+	% E/I populations
+	% Geometric connectivity constraints
+	% Excitatory reach >= inhibitory reach
+	% Random initial connectivity
+	% Feedforward input structure
+	
+	Neurons are arranged on a two-dimensional integer grid with periodic boundary conditions, forming a continuous spatial domain without boundary effects. 
+	Each population is defined on its own grid, which serves as a geometric scaffold for defining and analyzing connectivity patterns rather than a strict physical embedding. 
+	At each spatial location $(x,y)$, multiple neurons may be stacked along a third dimension $z$, forming local groups of neurons that receive similar inputs but differ through random connectivity. 
+	These stacked neurons can be interpreted as competing units within the same local receptive field.
+	
+	Connectivity is defined between populations, including recurrent connections within a population. 
+	For each pair of connected populations, synapses are organized into compartments, where each compartment corresponds to a specific source–target population pair (see $A_k$ in Eq.~\ref{eq:neuron_activation}). 
+	Each neuron receives a fixed number of synaptic inputs per compartment from the corresponding source population. This enforces a uniform in-degree across neurons while allowing variability in individual synaptic strengths.
+	
+	Spatial connectivity is determined geometrically. 
+	Coordinates between source and target populations are mapped via linear rescaling of the integer grid, allowing populations of different spatial resolutions to interact. 
+	For each target neuron, presynaptic partners are sampled uniformly at random from neurons within a local cylindrical neighborhood centered at the mapped spatial location. 
+	Due to grid rescaling, these neighborhoods may take the form of elliptical regions in the source population. 
+	The cylinder is defined over the two-dimensional spatial domain and spans the full stack dimension $z$, with distances computed under periodic boundary conditions.
+	Distances are computed under periodic boundary conditions.
+	
+	The spatial extent of these neighborhoods and the number of sampled synapses determine the effective connectivity range and density, and may differ across population pairs (e.g., excitatory versus inhibitory projections). 
+	Optionally, connectivity may extend over the full spatial domain.
+	
+	Initial synaptic weights are drawn independently from an exponential distribution and normalized to unit L1 norm within each compartment. 
+	This breaks symmetry in the initial connectivity and ensures a fixed total synaptic input per neuron.
+	
+	\medskip
+	
+	\noindent
+	This population-based construction provides a modular representation of network organization, where distinct populations can correspond to different cortical areas, layers, or neuron types. 
+	Connectivity is specified at the population level through geometric mapping and local sampling, allowing the same principles to govern both intra- and inter-population interactions while maintaining strict locality.
+	
+	
+	\subsection{Learning Rules}
+	\label{sec:learning}
+	All learning rules in the model satisfy a strict locality constraint: 
+	the update to a synapse $w_{ij}$ depends only on the presynaptic firing rate $r_j$, 
+	the postsynaptic firing rate $r_i$, the current synaptic weight $w_{ij}$, 
+	and statistics derived from the local synaptic population of neuron $i$. 
+	No global error signals, weight transport, or non-local information are used at any point.
+	
+	Learning is composed of two interacting components:
+	\begin{itemize}
+		\item synapse-specific updates driven by input--output correlations,
+		\item synaptic scaling mechanisms that regulate the overall synaptic distribution.
+	\end{itemize}
+	
+	Learning is implemented through a set of local update components, each capturing a distinct aspect of synaptic adaptation. 
+	These components are computed independently and later combined into the final synaptic update.
+
+\subsubsection{Cross-correlation Rule}
+\label{sec:cross}
+	
+As a first component, synaptic updates are driven by a Hebbian-style cross-correlation signal:
+
+\begin{equation}
+	\Delta h_{ij}^{(k)} = \eta_k \left(r_i - \bar{r}_{h,i}\right)\left(r_j - \bar{r}_{h,j}\right) r_i
+	\label{eq:hebb}
+\end{equation}
+
+where $\eta_k$ is the learning rate for compartment $k$. 
+This term represents a locally computed correlation signal and does not directly update the synaptic weight.
+
+The terms $\bar{r}_{h,i}$ and $\bar{r}_{h,j}$ denote exponential moving averages of the post- and presynaptic firing rates, respectively:
+
+\begin{equation}
+	\bar{r}_{h,i}[t] = EMA(\bar{r}_{h,i}[t-1], r_i[t], \alpha_{h,k})
+\end{equation}
+
+\begin{equation}
+	\bar{r}_{h,j}[t] = EMA(\bar{r}_{h,j}[t-1], r_j[t], \alpha_{h,k})
+\end{equation}
+
+where $\alpha_{h,k}$ controls the timescale of the correlation estimate in compartment $k$.
+
+This formulation captures deviations from recent activity averages, providing a locally centered measure of pre- and postsynaptic co-activation.
+
+\subsubsection{LTP--LTD Weight Dependence}
+
+
+As a second component, synaptic updates are modulated based on the current synaptic weight, introducing an asymmetry between potentiation and depression. 
+Large synapses undergo reduced potentiation (LTP) and enhanced depression (LTD), while smaller synapses are more easily strengthened.
+
+The modulated update signal is defined as
+
+\begin{equation}
+	\Delta l_{ij}^{(k)} =
+	a_{-} \left[\Delta h_{ij}^{(k)}\right]_{-}
+	\left(\tfrac{1}{2}(1 + k_s w_{ij})\right)^{b_{-}}
+	+
+	a_{+} \left[\Delta h_{ij}^{(k)}\right]_{+}
+	\left(\tfrac{1}{2}(1 + k_s w_{ij})\right)^{-b_{+}}
+	\label{eq:ltp}
+\end{equation}
+
+where $a_{+}$ and $a_{-}$ control the strength of potentiation and depression, respectively, 
+and $b_{+}, b_{-} > 0$ determine the degree of weight dependence. 
+The parameter $k_s$ denotes the number of synapses in the corresponding compartment.
+
+Here, $[\cdot]_+ = \max(0,\cdot)$ and $[\cdot]_- = \min(0,\cdot)$ denote the positive (LTP) and negative (LTD) components of the correlation signal.
+
+Due to L1 normalization of synaptic weights within each compartment, a compartment wide uniform weight configuration corresponds to $w_{ij} = 1/k_s$, for which the modulation factor equals one. 
+Thus, weight dependence is expressed relative to this baseline: synapses stronger than the uniform value are preferentially weakened, while weaker synapses are preferentially strengthened.
+This formulation makes the weight dependence invariant to the total number of synapses in the compartment.
+
+This mechanism suppresses runaway potentiation and promotes a balanced distribution of synaptic strengths.
+
+	
+	
+	\subsubsection{Regularization and Distribution Control}
+	
+	To counteract the tendency of Hebbian updates to concentrate weight onto a small subset of synapses, we introduce a regularization term that relaxes synaptic weights toward the uniform distribution within each compartment. 
+	This term operates in conjunction with the previously described learning components and is modulated by a homeostatic control variable.
+	
+	The regularization update is given by
+	\begin{equation}
+		\Delta g_{ij}^{(k)} = \beta_k \left(\frac{1}{k_s} - w_{ij}\right)\exp(N_{k,i}),
+		\label{eq:reg}
+	\end{equation}
+	where $k_s$ is again the number of synapses in the compartment. 
+	This term drives weights toward the uniform configuration $w_{ij} = 1/k_s$, while the scalar factor $\exp(N_{k,i})$ controls the overall strength of this relaxation.
+	
+	\vspace{0.5em}
+	\noindent
+	Rather than keeping this gain constant, it is adapted dynamically to regulate the shape of the weight distribution. 
+	Due to the effect of repeated multiplicative normalization updates (see section ... below) combined with L1 normalization, synaptic weights tend to follow approximately log-normal distributions on the simplex. 
+	We therefore define a target distribution by matching the empirical mean and coefficient of variation.
+	
+	Let
+	\begin{equation}
+		c = 1 + CV^2 = \frac{\mathbb{E}[w^2]}{\mathbb{E}[w]^2} = k_s \sum_{j \in k} w_{ij}^2,
+	\end{equation}
+	where the final equality follows from L1 normalization.
+	
+	The corresponding log-normal quantile at probability level $q$ is given by
+	\begin{equation}
+		w_q =
+		\frac{1}{k_s \sqrt{c}}
+		\exp\left(
+		-\sqrt{\log(c)} \, \sqrt{2}\,\mathrm{erfc}^{-1}(2q)
+		\right)
+		\label{eq:quantile}
+	\end{equation}
+	
+	The empirical fraction of weights below this quantile is then compared to the target value $q$, yielding a local error signal. 
+	The control variable $N_{k,i}$ is updated according to a two-regime rule:
+	
+	\begin{equation}
+		\Delta N_{k,i} = \nu_k
+		\begin{cases}
+			\left( \frac{1}{k_s} \sum_{j \in k} I(w_{ij} < w_q) \right) - q, & \text{if } c > \theta_q^2 + 1 \\
+			-1, & \text{otherwise}
+		\end{cases}
+		\label{eq:dN}
+	\end{equation}
+	
+	where $I(\cdot)$ is the indicator function and $\theta_q$ defines a lower bound on the coefficient of variation and $\nu_k$ is the update scaling rate of $N_{k,i}$.
+	
+	\vspace{0.5em}
+	\noindent
+	In the primary regime, this update drives the empirical quantile toward the target value, thereby shaping the weight distribution toward the desired log-normal form. 
+	However, when the distribution becomes too close to uniform, the quantile-based signal becomes uninformative, as the uniform distribution trivially satisfies the quantile condition. 
+	In this case, the second regime applies a maximal negative update, corresponding to the largest possible quantile error, in order to rapidly restore variance and avoid collapse to the uniform fixed point.
+	
+	\vspace{0.5em}
+	\noindent
+	Together, this mechanism implements a locally computable, adaptive control of synaptic weight distributions, balancing concentration driven by Hebbian updates with a dynamically regulated tendency toward uniformity.
+	
+	\subsubsection{LTP/LTD-Balancing}
+	\label{sec:ltp_ltd_balance}
+	
+	To prevent long-term imbalance between potentiation (LTP) and depression (LTD), 
+	a slow homeostatic control mechanism is introduced that regulates their relative 
+	strength based on the observed synaptic mass drift within each compartment.
+	
+	The objective of this mechanism is to ensure that, prior to normalization, the 
+	expected total synaptic change within each compartment vanishes over long 
+	timescales. While the subsequent L1-normalization enforces a constant total 
+	synaptic mass, it does not prevent systematic biases in the underlying update 
+	dynamics. The present controller compensates for such biases.
+	
+	To estimate the effective synaptic drift, the following quantity is computed:
+	\begin{equation}
+		\Delta W_{k,i}[t] = \sum_{j \in k} 
+		\left( \left[w_{ij}[t] + \Delta g_{ij}[t] + \Delta l_{ij}[t]\right]_+ - w_{ij}[t] \right),
+	\end{equation}
+	where $[\cdot]_+$ enforces non-negativity of synaptic weights. This expression 
+	captures the net feasible synaptic change after application of the update rules, 
+	accounting for the constraint that synapses cannot become negative.
+	
+	A slow exponential moving average of this drift is maintained:
+	\begin{equation}
+		E_{k,i}[t+1] = EMA\left(E_{k,i}[t], \Delta W_{k,i}[t], \alpha_{E,k}\right),
+	\end{equation}
+	where $\alpha_{E,k}$ determines the timescale of the estimation.
+	
+	The accumulated drift signal is integrated over time:
+	\begin{equation}
+		M_{k,i}[t+1] = M_{k,i}[t] + \zeta_k \, E_{k,i}[t+1],
+	\end{equation}
+	where $\zeta_k$ controls the adaptation rate.
+	
+	Finally, the relative strength of LTP and LTD is modulated via:
+	\begin{equation}
+		a_{+}^{(k,i)}[t+1] = \exp(-M_{k,i}[t]), 
+		\qquad 
+		a_{-}^{(k,i)}[t+1] = \exp(M_{k,i}[t]).
+	\end{equation}
+	
+	This parameterization ensures that persistent positive drift (net potentiation) 
+	increases the relative strength of LTD, while persistent negative drift 
+	increases LTP. As a result, the mechanism acts as an integral controller that 
+	drives the expected synaptic mass change toward zero over long timescales.
+	
+	\subsubsection{Normalization}
+	\label{sec:normalization}
+	
+	All synaptic weights are constrained to lie on the L1 simplex within each
+	compartment, i.e. for each neuron $i$ and compartment $k$:
+	\begin{equation}
+		\sum_{j \in k} w_{ij} = 1, \qquad w_{ij} \geq 0.
+	\end{equation}
+	
+	After applying synaptic updates, weights are projected and smoothly updated
+	toward a normalized target distribution. The update proceeds in three stages.
+	
+	\paragraph{(1) Candidate update and projection}
+	A candidate weight vector is formed using the additive updates:
+	\begin{equation}
+		w^{\text{cand}}_{ij}[t] = \left[w_{ij}[t] + \Delta g_{ij}[t] + \Delta l_{ij}[t]\right]_+,
+	\end{equation}
+	where $[\cdot]_+$ enforces non-negativity.
+	
+	This candidate vector is then projected onto the L1 simplex:
+	\begin{equation}
+		\tilde{w}_{ij}[t] = \frac{w^{\text{cand}}_{ij}[t]}{\|w^{\text{cand}}_{i\cdot}[t]\|_1},
+	\end{equation}
+	where $\|w^{\text{cand}}_{i\cdot}[t]\|_1 = \sum_{j \in k} w^{\text{cand}}_{ij}[t]$.
+	
+	\paragraph{(2) Smooth update}
+	To avoid abrupt changes in synaptic weights, the normalized candidate
+	$\tilde{w}_{ij}$ is incorporated via an exponential moving average:
+	\begin{equation}
+		w_{ij}^{\text{temp}}[t+1] = EMA\left(w_{ij}[t], \tilde{w}_{ij}[t], \alpha_{w,k}\right),
+	\end{equation}
+	where $\alpha_{w,k}$ controls the update timescale.
+	
+	\paragraph{(3) Renormalization}
+	Finally, the updated weights are renormalized to guarantee exact adherence
+	to the simplex constraint:
+	\begin{equation}
+		w_{ij}[t+1] = \frac{w_{ij}^{\text{temp}}[t+1]}{\|w^{\text{temp}}_{i\cdot}[t+1]\|_1}.
+	\end{equation}
+	
+	This two-stage projection ensures that weight updates remain smooth while
+	strictly preserving normalization and non-negativity at every time step.
+	
+	
+	\subsubsection{Synaptic Scaling}
+	\label{sec:synaptic_scaling}
+	
+	Synaptic scaling governs compartment-wise amplitude dynamics $A_{k,i}$, affecting all synapses within a compartment uniformly. These mechanisms commonly operate on slower timescales than synaptic updates and serve to regulate firing rates, balance input contributions, and stabilize network dynamics. Different connection types employ distinct scaling rules.
+	
+	\vspace{0.5em}
+	\noindent
+	\textbf{Compartmental Input and Grouping}
+	
+	The input from a single compartment $k$ to neuron $i$ is defined as
+	\begin{equation}
+		z_{k,i} = A_{k,i} \sum_{j \in k} w_{ij} r_j.
+	\end{equation}
+	
+	To allow flexible aggregation of multiple compartments, define for any group (G):
+	\begin{equation}
+		z_{G,i} = \sum_{k \in G} \sigma_{G,k} , z_{k,i},
+	\end{equation}
+	where $\sigma_{G,k} \in {-1,+1}$ specifies the sign contribution of each compartment. This enables combining excitatory and inhibitory inputs as well as overlapping compartment groupings.
+	
+	\vspace{0.5em}
+	\noindent
+	\textbf{Firing Rate Homeostasis (E--E, E--I)}
+	
+	To maintain a target firing rate, amplitudes are adjusted according to:
+	\begin{equation}
+		A_{k,i}[t+1] = A_{k,i}[t]
+		\left(\frac{r_{T,k}}{\bar{r}_{A,i} + \epsilon}\right)^{\delta_k},
+	\end{equation}
+	where $r_{T,k}$ is a target rate, $\bar{r}_{A,i}$ is an exponential moving average $EMA$ of the postsynaptic firing rate with timescale $\alpha_{A,k}$, and $\delta_k$ controls adaptation strength.
+	
+	\vspace{0.5em}
+	\noindent
+	\textbf{Input Ratio Control (I--E)}
+	
+	To regulate relative contributions of grouped inputs, define the ratio estimate:
+	\begin{equation}
+		\Xi_{k,i}^{(m,n)} = EMA\left(
+		\Xi_{k,i}^{(m,n)},
+		\frac{|z_{m,i}|}{|z_{n,i}|},
+		\alpha_{\Xi,k}
+		\right),
+	\end{equation}
+	
+	and the deviation from a target ratio $R_k$:
+	
+	\begin{equation}
+		\xi_{k,i} = R_k - \Xi_{k,i}^{(m,n)}.
+	\end{equation}
+	
+	Amplitude updates follow:
+	\begin{equation}
+		A_{k,i}[t+1] = A_{k,i}[t] \exp
+		\left(
+			[\xi_{k,i}]_{+}\gamma_{+,k}
+			+
+			[\xi_{k,i}]_{-}\gamma_{-,k}
+		\right),
+	\end{equation}
+	where $\gamma_{+,k}$ and $\gamma_{-,k}$ allow asymmetric responses.
+	
+	\vspace{0.5em}
+	\noindent
+	\textbf{I--I Stability Control}
+	
+	Scaling of inhibitory-to-inhibitory connections operates in two regimes and combines spatial decorrelation with temporal structure regulation.
+	
+	\paragraph{(1) Correlation Estimation}
+	
+	For a compartment group (m), define:
+	\begin{equation}
+		\Omega_{m,i} = |z_{m,i}|.
+	\end{equation}
+	
+	Track first and second moments:
+	\begin{align}
+		\mu_{m,i} &= EMA(\mu_{m,i}, \Omega_{m,i}, \alpha_{\Xi,k}), \\
+		\sigma_{m,i} &= EMA(\sigma_{m,i}, \Omega_{m,i}^2, \alpha_{\Xi,k}).
+	\end{align}
+	
+	The normalized cross-correlation between groups (m) and (n) is:
+	\begin{equation}
+		C_{m,n,i} = EMA\left(
+		C_{m,n,i},
+		\frac{(\Omega_{m,i}-\mu_{m,i})(\Omega_{n,i}-\mu_{n,i})}
+		{\sqrt{[\sigma_{m,i}-\mu_{m,i}^2]*+ + \epsilon}
+			\sqrt{[\sigma*{n,i}-\mu_{n,i}^2]*+ + \epsilon}},
+		\alpha*{\Xi,k}
+		\right).
+	\end{equation}
+	
+	Rectification ensures numerical stability, as EMA-based variance estimates may become negative or vanish.
+	
+	\paragraph{(2) Spectral Decomposition}
+	
+	To capture temporal structure, a multi-timescale filtering scheme is used:
+	\begin{equation}
+		\rho_{b,m,i} = EMA(\rho_{b,m,i}, \Omega_{m,i}, \alpha_b),
+	\end{equation}
+	for bands ($b \in {f, m, s}) with (\alpha_f > \alpha_m > \alpha_s$).
+	
+	Band-pass components are obtained via:
+	\begin{align}
+		x_f &= \Omega_{m,i} - \rho_{f,m,i}, \\
+		x_m &= \rho_{f,m,i} - \rho_{m,m,i}, \\
+		x_s &= \rho_{m,m,i} - \rho_{s,m,i}.
+	\end{align}
+	
+	For each band $x$, power is estimated:
+	\begin{align}
+		\mu_x &= EMA(\mu_x, x, \alpha_P), \\
+		\sigma_x &= EMA(\sigma_x, x^2, \alpha_P), \\
+		P_x &= [\sigma_x - \mu_x^2]_+.
+	\end{align}
+	
+	Total power is:
+	\begin{equation}
+		P_T = P_f + P_m + P_s.
+	\end{equation}
+	
+	\paragraph{(3) Spectral Control}
+	
+	Relative band power is regulated via:
+	\begin{align}
+		\omega_{k,i} =
+		&\ [\Theta_{f,h} - \frac{P_f}{P_T}]_+ e_{f,h}
+		- [\frac{P_f}{P_T} - \Theta_{f,l}]_+ e_{f,l} \\
+		&- [\Theta_{s,h} - \frac{P_s}{P_T}]_+ e_{s,h}
+		- [\frac{P_s}{P_T} - \Theta_{s,l}]_+ e_{s,l}.
+	\end{align}
+	
+	\paragraph{(4) Regime-Dependent Update}
+	
+	The system exhibits two empirically well-separated regimes. In highly correlated regimes, spectral adaptation can produce destabilizing feedback. Therefore, decorrelation is prioritized before spectral shaping is applied.
+	
+	The amplitude update is:
+	\begin{equation}
+		A_{k,i}[t+1] = A_{k,i}[t] \exp\Big(
+		[C_{m,n,i}-R_C]_+ \gamma_k
+		+
+		I([C_{m,n,i}-R_C]_{-}) \gamma_k \omega_{k,i}
+		\Big).
+	\end{equation}
+	
+	All control signals are based on slow exponential averages, ensuring robustness to fast fluctuations and stable regime separation across the population.
+		
+		
+\subsection{Receptive Field Structure Analysis}
+
+Feedforward receptive fields (RFs) are defined by the normalized synaptic weight distributions within input compartments. 
+For a neuron $i$, the receptive field is represented by the set of synaptic weights $w_{ij}$ associated with spatial input locations $x_j \in \mathbb{R}^2$, satisfying
+\begin{equation}
+	w_{ij} \geq 0,
+	\qquad
+	\sum_j w_{ij} = 1.
+\end{equation}
+
+Due to this positivity and normalization constraint, receptive fields are naturally interpreted as spatial distributions on the positive L1 simplex rather than unconstrained Euclidean vectors. 
+Accordingly, RF organization is characterized using measures that capture spatial structure, distributional concentration, and inter-neuron diversity.
+
+\vspace{0.5em}
+\noindent
+\textbf{(1) Multiscale spatial smoothness.}
+
+To quantify spatial organization, a geometric neighborhood graph is constructed over the input domain. 
+For a spatial radius $r$, let $\mathcal{N}_r(j)$ denote the set of input locations within radius $r$ of location $j$. 
+A multiscale smoothness measure is then defined as
+
+\begin{equation}
+	S_i(r)
+	=
+	\frac{1}{|V|}
+	\sum_j
+	\frac{1}{|\mathcal{N}_r(j)|}
+	\sum_{k \in \mathcal{N}_r(j)}
+	D(w_{ij}, w_{ik}),
+\end{equation}
+
+where $|V|$ denotes the number of spatial input locations and $D(\cdot,\cdot)$ is a local discrepancy measure.
+
+Unless otherwise stated, the primary smoothness measure uses quadratic local differences:
+\begin{equation}
+	D_2(a,b) = (a-b)^2.
+\end{equation}
+
+This formulation corresponds to a graph-Laplacian-like measure of spatial roughness and provides a spatial spectral characterization of receptive field organization across multiple spatial scales.
+
+Optionally, simplex-aware discrepancy measures may also be considered, including symmetric divergence-based forms such as
+\begin{equation}
+	D_{\mathrm{KL}}(a,b)
+	=
+	(a-b)\log\left(\frac{a+\epsilon}{b+\epsilon}\right),
+\end{equation}
+with small $\epsilon > 0$ for numerical stability.
+
+Lower smoothness values correspond to locally coherent receptive fields, while larger values indicate stronger spatial variation or fragmented structure.
+
+\vspace{0.5em}
+\noindent
+\textbf{(2) Receptive field concentration and spatial extent.}
+
+To characterize the spatial scale of receptive fields, the spatial center of mass is computed:
+\begin{equation}
+	\mu_i = \sum_j w_{ij} x_j.
+\end{equation}
+
+The spatial variance of the receptive field is then defined as
+\begin{equation}
+	\sigma_i^2
+	=
+	\sum_j
+	w_{ij}
+	\|x_j - \mu_i\|^2.
+\end{equation}
+
+This quantity measures the effective spatial spread of the receptive field and distinguishes localized feature detectors from broadly distributed representations.
+
+In addition, receptive field concentration is quantified using the Shannon entropy
+\begin{equation}
+	H_i
+	=
+	-
+	\sum_j
+	w_{ij}\log(w_{ij}+\epsilon),
+\end{equation}
+which measures the effective distribution of synaptic mass across the input domain.
+
+\vspace{0.5em}
+\noindent
+\textbf{(3) Inter-neuron receptive field diversity.}
+
+To measure representational diversity across neurons, pairwise similarity between receptive fields is quantified using the Jensen--Shannon (JS) divergence between normalized weight distributions:
+\begin{equation}
+	\mathrm{JS}(W_i,W_k)
+	=
+	\frac{1}{2}
+	D_{\mathrm{KL}}(W_i \| M)
+	+
+	\frac{1}{2}
+	D_{\mathrm{KL}}(W_k \| M),
+\end{equation}
+where
+\begin{equation}
+	M = \frac{1}{2}(W_i + W_k).
+\end{equation}
+
+Because receptive fields are constrained to the positive simplex, divergence-based comparisons provide a more natural measure of RF specialization and overlap than Euclidean similarity measures.
+
+\vspace{0.5em}
+\noindent
+Together, these measures characterize emergent receptive field organization in terms of multiscale spatial structure, concentration, spatial extent, and population-level representational diversity.
+	
+	
+	
+	
+	
+	
+	% ================================================================
+	% 4. RESULTS
+	% ================================================================
+	\section{Results}
+	\label{sec:results}
+	
+	\subsection{Stable Population Firing Rates with Representational Drift}
+	
+	% Key result 1
+	% Population statistics bounded
+	% Individual neurons drift
+	% Figures: rate distributions over time, individual traces
+	
+	[Describe result, reference figures.]
+	
+	\subsection{Robustness to Initialization}
+	
+	% Key result 2
+	% Wide range of initial L1 norms
+	% All converge to stable statistical regime
+	% Figures: family of curves from different initializations
+	
+	[Describe result, reference figures.]
+	
+	\subsection{Emergent Feedforward Weight Organization}
+	
+	% Key result 3
+	% Spatial localization in 2D
+	% Orientation-like selectivity without oriented input
+	% Different filter character at different stack depths
+	% Filter drift over time
+	% Figures: weight maps, receptive fields, spatial organization
+	
+	[Describe result, reference figures.]
+	
+	\subsection{Unstructured Recurrent Weights}
+	
+	% Key result 4
+	% Recurrent weights remain noisy
+	% Contrast with feedforward organization
+	% Functional interpretation
+	
+	In contrast to the feedforward weights, recurrent weight matrices
+	show no visible spatial organization and appear noisy throughout
+	learning. [Expand on functional interpretation --- separation of
+	dynamics from representation.]
+	
+	\subsection{Lognormal Weight Distributions}
+	
+	% Key result 5
+	% Emergent lognormal across synapse types
+	% Comparison to biological data
+	% Figures: weight histograms, lognormal fits
+	
+	[Describe result, reference figures.]
+	
+	% ================================================================
+	% 5. DISCUSSION
+	% ================================================================
+	\section{Discussion}
+	\label{sec:discussion}
+	
+	\subsection{Relationship to Biological Learning}
+	
+	% Synaptic scaling literature
+	% Representational drift literature
+	% Silent synapses
+	% Lognormal distributions in cortex
+	% Orientation selectivity
+	% Metabolic constraints
+	
+	[Discuss each biological parallel in turn, citing relevant literature.]
+	
+	\subsection{Relationship to Existing Computational Models}
+	
+	% What is different from standard approaches
+	% Comparison to models that fix inhibition
+	% Comparison to models that require careful initialization
+	% Comparison to models that use global signals
+	% The constraint strictness as the key distinction
+	
+	[Discuss how the model differs from existing work, being precise
+	about which constraints are relaxed in other models and why
+	that matters.]
+	
+	\subsection{Control Theory Interpretation}
+	
+	% Simplex dynamics
+	% The scaling rule as a local controller
+	% Why this is more than homeostasis
+	
+	[Discuss the control theory framing and what it adds beyond
+	standard homeostatic plasticity interpretations.]
+	
+	\subsection{Neuromorphic Implications}
+	
+	% Translation to spiking neurons
+	% Local rules map naturally to neuromorphic hardware
+	% Energy efficiency
+	% Online learning without retraining
+	
+	[Discuss translation to spiking dynamics and neuromorphic hardware
+	relevance.]
+	
+	\subsection{Limitations and Future Work}
+	
+	% Toy scale
+	% MNIST as impoverished input
+	% ML extension requires supervised signal
+	% Multi-module hierarchy as next step
+	% Scaling experiments
+	
+	The current model is demonstrated at toy scale with MNIST as visual
+	input. [Discuss limitations honestly and frame future directions
+	clearly.]
+	
+	\subsection{Conclusion}
+	
+	We have presented a recurrent neural network model that achieves
+	stable population dynamics, representational drift, and emergent
+	feedforward organization under strict biological constraints and fully
+	local learning rules. The key insight is that treating the L1 norm
+	of synaptic weights as a metabolically motivated control variable,
+	and expressing synaptic scaling as a simplex-aware multiplicative
+	operation modulated by local firing statistics, is sufficient to
+	prevent Hebbian runaway without any of the standard computational
+	shortcuts. The resulting system exhibits a range of cortical
+	phenomena as emergent consequences of its constraints rather than
+	as designed outcomes.
+	
+	% ================================================================
+	% ACKNOWLEDGEMENTS
+	% ================================================================
+	\section*{Acknowledgements}
+	
+	[Optional. Can acknowledge tools used, including AI assistance
+	in crystallizing ideas, if desired.]
+	
+	% ================================================================
+	% REFERENCES
+	% ================================================================
+	\bibliographystyle{plainnat}
+	\bibliography{references}
+	
+	% Placeholder citations for structure ---
+	% Replace with actual .bib file entries
+	% Key references to include:
+	% - Turrigiano synaptic scaling
+	% - Representational drift (Schoonover, Rokni, Ziv lab)
+	% - Lognormal distributions (Buzsaki, Loewenstein)
+	% - Silent synapses (Isaac, Liao)
+	% - Inhibitory plasticity (Vogels, Zenke)
+	% - Metabolic cost of synapses
+	% - Control theory / homeostasis
+	% - Geometric connectivity in cortex
+	
+	% ================================================================
+	% APPENDICES
+	% ================================================================
+	\appendix
+	\section{Derivation of Log-Normal Quantile on the Simplex}
+	\label{appendix:quantile}
+	
+	This section derives the expression for the quantile $w_q$ of a log-normal weight distribution under the constraint of L1-normalization within a compartment.
+	
+	\subsection{Log-normal distribution}
+	
+	Let $w$ be a log-normally distributed random variable:
+	\begin{equation}
+		w \sim \mathrm{LogNormal}(\mu, \sigma^2),
+	\end{equation}
+	with quantile function
+	\begin{equation}
+		w_q = \exp\left(\mu + \sigma \Phi^{-1}(q)\right),
+	\end{equation}
+	where $\Phi^{-1}(q)$ is the inverse cumulative distribution function of the standard normal distribution.
+	
+	\subsection{Parameterization via mean and coefficient of variation}
+	
+	The log-normal parameters can be expressed in terms of the mean $\mu_x = \mathbb{E}[w]$ and coefficient of variation $CV$:
+	\begin{equation}
+		\mu = \log\left(\frac{\mu_x}{\sqrt{1+CV^2}}\right), 
+		\quad
+		\sigma = \sqrt{\log(1+CV^2)}.
+	\end{equation}
+	
+	Substituting into the quantile expression yields:
+	\begin{align}
+		w_q 
+		&= \exp\left(
+		\log\left(\frac{\mu_x}{\sqrt{1+CV^2}}\right)
+		+ \sigma \Phi^{-1}(q)
+		\right) \\
+		&= \frac{\mu_x}{\sqrt{1+CV^2}} \cdot \exp\left(\sigma \Phi^{-1}(q)\right).
+	\end{align}
+	
+	\subsection{Simplex constraint}
+	
+	Synaptic weights are L1-normalized within each compartment containing $k_s$ synapses:
+	\begin{equation}
+		\sum_{j \in k} w_{ij} = 1.
+	\end{equation}
+	
+	The mean weight is therefore
+	\begin{equation}
+		\mu_x = \frac{1}{k_s}.
+	\end{equation}
+	
+	Define
+	\begin{equation}
+		c = 1 + CV^2.
+	\end{equation}
+	
+	The quantile becomes
+	\begin{equation}
+		w_q = \frac{1}{k_s \sqrt{c}} \cdot \exp\left(\sqrt{\log(c)} \, \Phi^{-1}(q)\right).
+	\end{equation}
+	
+	\subsection{Relation to second moment}
+	
+	Using the definition of the coefficient of variation:
+	\begin{equation}
+		CV^2 = \frac{\mathbb{E}[w^2]}{\mathbb{E}[w]^2} - 1,
+	\end{equation}
+	and $\mathbb{E}[w] = 1/k_s$, it follows that
+	\begin{equation}
+		c = \frac{\mathbb{E}[w^2]}{\mathbb{E}[w]^2}
+		= k_s \sum_{j \in k} w_{ij}^2.
+	\end{equation}
+	
+	\subsection{Expression using the complementary error function}
+	
+	Using the identity
+	\begin{equation}
+		\Phi^{-1}(q) = -\sqrt{2}\,\mathrm{erfc}^{-1}(2q),
+	\end{equation}
+	the quantile can be written as
+	\begin{equation}
+		w_q =
+		\frac{1}{k_s \sqrt{c}}
+		\exp\left(
+		-\sqrt{\log(c)} \, \sqrt{2}\,\mathrm{erfc}^{-1}(2q)
+		\right).
+	\end{equation}
+	
+	This provides a closed-form estimate of the target quantile in terms of locally measurable statistics of the synaptic weight distribution.
+	
+	% ================================================================
+	% FIGURES (at end, biorxiv style)
+	% ================================================================
+	\newpage
+	\section*{Figures}
+	
+	\begin{figure}[H]
+		\centering
+		\includegraphics[width=0.9\textwidth]{figures/fig1_architecture.pdf}
+		\caption{\textbf{Network architecture.}
+			(A) Schematic of the 2D spatial layout with depth axis.
+			(B) Geometric connectivity constraints for excitatory and inhibitory
+			populations.
+			(C) Feedforward input structure.
+			Scale bars and parameter values as indicated.}
+		\label{fig:architecture}
+	\end{figure}
+	
+	\begin{figure}[H]
+		\centering
+		\includegraphics[width=0.9\textwidth]{figures/fig1_architecture.pdf}
+		\caption{\textbf{Stable population firing rates with representational drift.}
+			(A) Population firing rate distribution at multiple timepoints.
+			(B) Individual neuron firing rate traces over time.
+			(C) Population statistics (mean, variance) remain bounded while
+			individual neurons drift.}
+		\label{fig:stability}
+	\end{figure}
+	
+	\begin{figure}[H]
+		\centering
+		\includegraphics[width=0.9\textwidth]{figures/fig1_architecture.pdf}
+		\caption{\textbf{Robustness to initialization.}
+			Family of curves showing population rate statistics over time
+			for a wide range of initial L1 norm values. All initializations
+			converge to the same statistical regime.}
+		\label{fig:robustness}
+	\end{figure}
+	
+	\begin{figure}[H]
+		\centering
+		\includegraphics[width=0.9\textwidth]{figures/fig1_architecture.pdf}
+		\caption{\textbf{Emergent feedforward weight organization.}
+			(A) Spatial map of feedforward weight localization in the 2D plane
+			at multiple timepoints.
+			(B) Receptive field examples showing edge, line, and corner
+			selectivity for neurons at different spatial locations.
+			(C) Depth-dependent filter diversity at the same 2D location.
+			(D) Illustration of filter drift over time.}
+		\label{fig:ff_weights}
+	\end{figure}
+	
+	\begin{figure}[H]
+		\centering
+		\includegraphics[width=0.9\textwidth]{figures/fig1_architecture.pdf}
+		\caption{\textbf{Emergent lognormal weight distributions.}
+			(A) Weight distributions for excitatory, inhibitory, and feedforward
+			synapse types.
+			(B) Lognormal fits.
+			(C) Comparison to biological data where available.
+			(D) Recurrent weight maps showing absence of spatial structure.}
+		\label{fig:distributions}
+	\end{figure}
+	
+	
+	\bibliographystyle{unsrtnat}   % or apalike, plainnat, etc.
+	\bibliography{references}       % points to references.bib
+	% ================================================================
+\end{document}
+% ================================================================
