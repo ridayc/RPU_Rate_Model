@@ -3,43 +3,102 @@ import math
 import numpy as np
 from scipy.special import erfcinv
 import copy as cp
-import h5py
 
+# Main class of the network
+# All network populations as well as compartments (population connectivity modules) and all system wide parameters
 class Network:
     def __init__(self,device,populations_param,compartments_param):
+        # device for pytorch reference
         self.device = device
+        # time step tracker
+        # Is assumed to be an integer for storage and never below 0
         self.time = 0
+        self.freeze = False
+
+        # list of neuron populations. Python dictionaries mean that the populations must have unique identifiers (Since there is no try catch here, old populations with same name will be silently dropped (considering adding a message for this, as this is low cost here))
+        # please don't call any of the populations timesteps... otherwise there will be confusion when saving the rate and structure data
         self.populations = {}
         for v in populations_param.values():
             self.populations[v["id"]] = Population(v,self)
+        # compartments are created based on the user set compartment parameters and always stored in a dictionary in the target neuron population. Compartments are unique, but there can (hypothetically) be multiple different compartments between the same two populations
         for v in compartments_param.values():
             c = Compartment(v,self)
             c.target.add_compartment(c)
+        # SST neurons potentially link signals from different compartments on the same target neurons. For this reason SST neurons need to set target compartment links after all compartments have been instanciated.
+        for pop in self.populations.values():
+            for comp in pop.compartments.values():
+                if comp.SST is not None:
+                    comp.SST.setup(comp)
+        
 
-    def iterate(self):
-        # 1. Calculate local crosscorrelation and temporal and spatial coefficients for different types of inhibitory machinary
-        # 2. Update all compartment weights based on current pre-/post weights
-        # 3. In a second run through update all population firing rates (using the updated weights)
+    # iterate contains the network update for every timestep
+    def iterate(self,writer=None,rate_logger=None):
+        # 0. weight, amplitude, dM, dN (writer) and rate (rate_logger) storage in h5 files
+        # 1. Calculate local crosscorrelation and temporal and spatial coefficients for different types of commonly inhibitory amplitude learning machinery
+        # 2. Update all compartment weights based on current pre-/post weights and firing rates
+        # 3. Update all compartment activations. The the activations are up to date for the rate updates
+        # 4. Update all population firing rates (using the updated weights)
         # 4. Increment timestep
-        for v in self.populations.values():
-            v.E_I_balance()
-        for v in self.populations.values():
-            v.update_weights()
-        for v in self.populations.values():
-            v.activations()
-        for v in self.populations.values():
-            v.update_rates()
+        # 1. and 2. are compartment wide synapse, neuron and other state updates. Assumes rates are fixed Hence compartment streams.
+        # 3. Is population wide and requires all synapse weights to be stable (compartment streams ended). Population streams should end before the next iteration (hence the final synchronize)
+        # All functions that are at this level need to fit into this schema, otherwise streams can break state consistency.
+           
+        for pop in self.populations.values():
+            for comp in pop.compartments.values():
+                # to use streams here we assume that each compartment updates all values using only information present in the compartment or cell that will not be updated by another compartment (that's what independent means, but any changes to code here need to be checked for this)
+                with torch.cuda.stream(comp.stream):
+                    if (comp.stat):
+                        # different correlation statistic measurement. Currenty only used for observation purposes
+                        comp.mixing_update()
+                    if(not self.freeze): 
+                        # selective power spectrum and correlation based measurement used for learning rules (synapses or amplitudes) which rely on different power bands 
+                        comp.band_update()
+                        # synaptic and amplitude weight updates per compartment
+                        comp.update_weights()
+                    comp.local_rate()
+        for pop in self.populations.values():
+            for comp in pop.compartments.values():
+                pop.stream.wait_stream(comp.stream)
+            for comp in pop.compartments.values():
+                with torch.cuda.stream(comp.stream):
+                    # activations are per compartment and depend on the old rates, so they should be processed in the compartment before and parallel rate updates could happen
+                    comp.update_lrates()
+        
+        for pop in self.populations.values():
+            # before updating activations and rates we need to make sure that all compartments into the population have completed their weights updates
+            for comp in pop.compartments.values():
+                pop.stream.wait_stream(comp.stream)
+            if writer is not None:
+                pop.store_snapshot_async(writer.cpu_buffers)
+            # we assume that activations depend on input compartments, and that the rate update purely depends on the resulting cell wide activation. Changing this might require a review of the stream procedure here
+            with torch.cuda.stream(pop.stream):
+                # activations essentially assembles the local input rate accumulators
+                pop.activations()
+                pop.update_rates()
+
+            # potential memory dumps for rates or rates should come here 
+            # ...
+            # afterwards we want to guarantee for the next iteration that all streams are synchronized again. We consider letting population streams weave into the next iteration and weight updates, but there are a lot of potentially messy scenarios that might create debugging headaches.
+        torch.cuda.synchronize()
+        if writer is not None:
+            writer.write(self.time)
+        if rate_logger is not None:
+            rate_logger.record(self)
+        # increase the iteration counter
         self.time+=1
 
+    # quick function to generate an iterator over all compartments in all populations
     def iter_compartments(self):
         for p in self.populations.values():
             for c in p.compartments.values():
                 yield c
 
+    # Create a full snapshot of the whole network state on whatever device it’s currently on. This can generate a large file.
+    # using pickle means that network might not be reconstructable for large scale updates object storage in the network code.
     def save(self, path: str):
-        # Full snapshot on whatever device it’s currently on
         torch.save(self, path, pickle_protocol=4)
 
+    # load that works on networks stored with save
     @staticmethod
     def load(path: str, device=None):
         # Remap *all* tensors to CPU/GPU on load (works for nested dicts too)
@@ -50,126 +109,229 @@ class Network:
             net.device = device
         return net
 
+
+# the neuron population class
+# The variables stored here are neuron wide in the respective populations and not restricted compartments
 class Population:
     def __init__(self,population_param,network):
+        # back reference to the network itself. This is to keep a reference to network timestep and device without keeping a population copy
         self.net = network
+        # compartments (population level connectivity) that are formed onto this population
         self.compartments = {}
+        # unique population identifier. Relevant for target, source relationships of compartments
         self.id = population_param["id"]
+        # commonly a 3D grid structure the neurons are assumed to live on, but this can be generically altered to N-D if desired
+        # N-D however would create a less biological connectivity mapping, and the current connectivity creation approaches assume a 3D structure will be created
+        # But N-D could be an interesting future direction to expand in with low cost (but this comes at the cost of untethering from a 3-D space universe...)
         self.size = cp.deepcopy(population_param["size"])
+        # total number of neurons in the population
         self.nneu = math.prod(self.size)
+        # stiffness of the leaky RePU (rectified polynomial unit) neuron
         self.tau = population_param["tau"]
+        # polynomial exponent of the neurons in (0,inf) 
         self.p = population_param["p"]
+        # characteristic response scale firing rate (at which the RePU intersects f(x)=x)
         self.r0 = population_param["r0"]
-        self.baseline = population_param["baseline"]
+        # the minimal firing rate of population neurons (will be adjusted to be >=0 to avoid sign errors for firing rates)
+        self.bias = population_param["bias"]
+        # hard cap for the maximum firing rate that at which population neurons will fire
         self.cap = population_param["cap"]
+        # activation function. The default assumes all compartment activations are simply added together. It is assumed that the activation will return the activation value over all 
         self.activation = population_param["activation"]
+        # current firing rates of the cells
         self.rates = torch.zeros(self.nneu).to(self.net.device)
+        # immediate activation function result of the current input. This is essentially smoothed into the rates (hence a leaky model)
         self.uact = torch.zeros(self.nneu).to(self.net.device)
+        # combination of the compartment contributions before applying the polynomial exponent and non-linearity
         self.u_eff = torch.zeros(self.nneu).to(self.net.device)
+        # the part of u_eff contributed from excitatory inputs
         self.E_eff = torch.zeros(self.nneu).to(self.net.device)
+        # the part of u_eff contributed from inhibitory inputs. Values are expected to be negative
         self.I_eff = torch.zeros(self.nneu).to(self.net.device)
-        self.ravg = self.r0
-        self.rsq = self.r0*self.r0
+        # tracker of the momentary average of the firing rate of the whole population. This can be used as a proxy for SST type inhibitory neurons at a later point
+        self.ravg = torch.zeros(1).to(self.net.device)
+        self.ravg[0] = self.r0
+        # tracker of the momentary average of the squared firing rate of the whole population. This can be used as a proxy for SST type inhibitory neurons at a later point
+        self.rsq = torch.zeros(1).to(self.net.device)
+        self.rsq[0] = self.r0*self.r0
+        # GPU stream to run independent population operations in parallel and fill up the GPU better
+        self.stream = torch.cuda.Stream()
 
+    # add a compartment to the current population (uses a unique compartment identifier per population. Currently without try catch)
     def add_compartment(self,compartment):
         self.compartments[compartment.id] = compartment
 
+    # combine the compartment activation contributions via the compartment activation function and apply the polynomial rectification to the result.
     def activations(self):
         u = [{},{}]
         for v in self.compartments.values():
-            v.local_rate()
             u[0][v.id] = v.lrates
+            # the neuron types here are the sign of their rate contribution. -1 for inhibitory neurons and 1 for excitatory neurons
             u[1][v.id] = v.type
+        # if there is at least one input compartment (might not be the case for input neurons) then calculate the activation
         if len(u[0])>0:
             self.u_eff[:],self.E_eff[:],self.I_eff[:] = self.activation(u)
-            self.u_eff.clamp_(min=0)
-            self.uact[:] = torch.clamp((self.u_eff**self.p)*self.r0**(1-self.p),min=self.baseline,max=self.cap)
+            self.u_eff.add_(self.bias).clamp_(min=0)
+            pinv = 1/self.p
+            self.uact[:] = torch.clamp((self.u_eff**self.p)*self.r0**(1-self.p)*pinv,min=0,max=self.cap)
+        # for input neurons we apply dummy values. The main reason for this is so that activation function developers don't need to handle compartments for neurons with none... But this could likely be solved more elegantly.
         else:
             self.uact[:] = 0.
             self.u_eff[:] = 1.
             self.I_eff[:] = -3.
             self.E_eff[:] = 1.
 
-
+    # leaky rate update as well as computation of the population average of rates and squared rates
     def update_rates(self):
-        self.rates[:] = (1-self.tau)*self.rates+self.tau*self.uact
-        self.ravg = torch.mean(self.rates).item()
-        self.rsq = torch.mean(self.rates*self.rates).item()
+        #self.rates[:] = (1-self.tau)*self.rates+self.tau*self.uact
+        # same as above formulation
+        smoothing(self.rates,self.uact,self.tau)
+        self.ravg[0] = torch.mean(self.rates)
+        self.rsq[0] = torch.mean(self.rates*self.rates)
 
+    # weight updates per compartment
     def update_weights(self):
         for v in self.compartments.values():
             v.update_weights()
 
+    # power band and spectrum variable updates and measurements
     def E_I_balance(self):
-        counter = 0
-        # get
         for v in self.compartments.values():
             if (v.stat):
+                # different correlation statistic measurement. Currenty only used for observation purposes
                 v.mixing_update()
+            # selective power spectrum and correlation based measurement used for learning rules (synapses or amplitudes) which rely on different power bands 
             v.band_update()
 
+    # full object save can't handle cuda stream objects so we work around that with a save and load state that removes the stream of this class
+    def __getstate__(self):
+        """Tell pickle what to save."""
+        # Create a shallow copy of the object's dictionary
+        state = self.__dict__.copy()
+        # Remove the stream object so it doesn't block the save
+        if 'stream' in state:
+            state['stream'] = None 
+        return state
 
-# connectivity modules connecting two neuron populations. Two populations can have multiple separate compartments together.
+    def __setstate__(self, state):
+        """Tell pickle how to restore."""
+        self.__dict__.update(state)
+        # Re-initialize a fresh stream upon loading
+        import torch
+        self.stream = torch.cuda.Stream()
+
+    # beware -> if this is made to write in parallel while rates are being computed, lrates would have to be removed!
+    def store_snapshot_async(self, cpu_buffers):
+        for comp in self.compartments.values():
+            buf = cpu_buffers[self.id][comp.id]
+            with torch.cuda.stream(self.stream):
+                buf["w"].copy_(comp.w, non_blocking=True)
+                buf["a"].copy_(comp.a, non_blocking=True)
+                buf["dN"].copy_(comp.dN, non_blocking=True)
+                buf["dM"].copy_(comp.dM, non_blocking=True)
+                buf["numerator"].copy_(comp.numerator, non_blocking=True)
+                buf["denominator"].copy_(comp.denominator, non_blocking=True)
+                buf["ravg"].copy_(comp.rate_average, non_blocking=True)
+                buf["r2avg"].copy_(comp.rate_square, non_blocking=True)
+                buf["rhin"].copy_(comp.rate_in, non_blocking=True)
+                buf["rhout"].copy_(comp.rate_out, non_blocking=True)
+                buf["wq"].copy_(comp.wq, non_blocking=True)
+                if "amplitude" in comp.rate_band:
+                    for band in comp.rate_band["amplitude"]["p"].keys():
+                        buf[f"band_p_{band}"].copy_(comp.rate_band["amplitude"]["p"][band], non_blocking=True)
+
+
+# connectivity modules connecting two neuron populations. Two populations can have multiple separate compartments in the same direction (compartment identifiers need to be unique)
 class Compartment:
     def __init__(self,compartment_param,network):
+        # different relevant ids
+        # the target population. This compartment is stored in a dictionary in that population
         self.targetid = compartment_param["target"]
+        # the source population where the input to this compartment comes from
         self.sourceid = compartment_param["source"]
+        # pointers to the actual populations in the network module
         self.target = network.populations[self.targetid]
         self.source = network.populations[self.sourceid]
+        # a pointer to the whole network
         self.net = network
+        # unique id of this compartment (the id should be unique among the compartments in this population)
         self.id = compartment_param["id"]
+        # The initial neuron amplitude parameter for all neurons. This is not used once the per neuron amplitude tensor has been created
         self.A = compartment_param["A"]
+        # This is a target amplitude value that all ampltitudes are drawn towards (depends on the learning rate for this parameter)
         self.A0 = compartment_param["A0"]
+        # since the amplitude targeting is learned in a logarithmic space we do the conversion and store a variable
         self.lA0 = np.log(np.abs(compartment_param["A0"]))
+        # the neuron type - Inhibitory vs Excitatory is determined by the intial sign of the initial amplitude value
         self.type = np.sign(self.A)
+        # later on amplitudes will be forced to be strictly positive (for log calculations etc), so we start working with positive amplitudes at this point already. Meh.
         self.A0 = np.sign(self.A0)*self.A0
         self.A*=self.type
+        # This is the covariance rule ("Hebbian") learning rate
         self.eta = compartment_param["eta"]
+        # learning rate of the an/ap balancing. Essentially the learning rate of how quickly ltp and ltd should become balanced on a long term average
         self.etal = compartment_param["etal"]
+        # the learning rate of the shape balancing function. This essentially determines how quickly the weight distribution regularizer adjusts to the current weight distribution.
         self.etar = compartment_param["etar"]
+        # below this cv value the relaxation coefficient of synaptic weight distribution will be lower (A low CV value implies the synaptic weight distribution is too narrow)
         self.thetar = compartment_param["thetar"]
-        self.alpha = compartment_param["alpha"]
-        self.nu = compartment_param["nu"]
+        # intial relaxation rate of the synpatic weights (essentially a form of linear weight decay)
         self.beta = compartment_param["beta"]
+        # the minimal value that the beta parameter should be able to be multiplied. There is a minimal value, so that the relaxation term can not indefinitely drift towards zero
         self.beta0 = np.log(compartment_param["beta0"])
+        # decay and growth exponents resp. of the asymmetric ltp/ltd rule
         self.bn = compartment_param["bn"]
         self.bp = compartment_param["bp"]
+        # the quantile at which the synaptic weight distribution should be compared against the same quantile of a log normal distributoin
         self.kappa = compartment_param["kappa"]
+        # a constant for the log normal distribution quantile location estimate
         self.zq = -np.sqrt(2)*erfcinv(2*self.kappa)
+        # learning rate of the amplitude scaling (predominantly E-E and E-I amplitudes)
         self.delta = compartment_param["delta"]
+        # target ampltitude for neurons. Generally not used unless drift towards zero or infinity is expected and should be prevented
         self.rho = compartment_param["rho"]
-        #self.gamma = compartment_param["gamma"]
+        # double sided learning rates for special amplitude learning. Commonly the I/E input ratio for I-E amplitudes, and the correlation/spectra learning of I-I amplitudes
         self.zeta = compartment_param["zeta"]
         self.zeta2 = compartment_param["zeta2"]
+        # currently cosmetic tau value that is used to track average long term firing of neurons in this compartment (intended for readout)
         self.tau = compartment_param["tau"]
+        # smoothing constant for the normalization projection
         self.tauw = compartment_param["tauw"]
+        # currently cosmetic tau value that is used to track average long term squared firing rates of neurons in this compartment (intended for readout)
         self.taub = compartment_param["taub"]
+        # smoothing constant for the ltp/ltd imbalance estimation
         self.taul = compartment_param["taul"]
+        # smoothing constant for estimates of gain ratios or input crosscorrelation estimates
         self.taug = compartment_param["taug"]
-        #self.tauz = compartment_param["tauz"]
+        # for other options than covariance learning rule. This is set to one to represent the covariance rule
         self.rin = compartment_param["rin"]
         self.rout = compartment_param["rout"]
+        # this stores the averaging timescale for the covariance learning rule above. A negative sign in this value indicates that covariance rule is multiplied with input/output rate resp.
         self.tauin = compartment_param["tauin"]
         self.tauout = compartment_param["tauout"]
-        #self.cv = compartment_param["cv"]
-        # rate quatile for thresholding high rate events for PV neurons (I-I amplitude controller)
+        # "Dead" synapse adjustment of the weight distribution relaxation. Quantiles of synapse weights are compared against log normal quantiles of the same CV. This value makes the distribution slightly broader by adjusting the target quantile. This introduces a small pool of noisy near zero weight synapes into the pool with the purpose of increasing cascading synaptic drift.
         self.rq = compartment_param["rq"]
-        self.rt = compartment_param["rt"]
-        self.noise = compartment_param["noise"]
-        #self.cv = compartment_param["cv"]
+        # noise injection for the initial weight distribution
         self.eps = compartment_param["eps"]
+        # synapse type beyond excitatory or inhibitory. Needed for SST type and other later synapses
         self.stype = compartment_param["stype"]
-        self.M = 0
+        # average firing rate target for this compartment. Only relevant if self.delta is >0
         self.rate_target = compartment_param["rate_target"]
+        # target value for the learning described with zeta and zeta2
         self.z_value = compartment_param["z_value"]
+        # threshold value under which the z_value based learning is zero to zero
         self.thetaz = compartment_param["thetaz"]
+        # string indicating the type of gain ratio for amplitude learning to be based on
         self.ratio = compartment_param["ratio"]
+        # list of single compartments relevant for gain ratio amplitude learning
         self.c_c = compartment_param["c_c"]
-
+        # default structure
+        # first value if the enumerator id
+        # second value is used only when the ratio of two specific compartments on the target neuron are being compared
         if(self.c_c[0]==""):
             self.c_c[0] = self.id
         self.stat = compartment_param["stat"]
-        # measurment variables for excitatory compartments. Local correlation and coefficient of variance markers
+        # measurment variables for compartments. Local correlation and coefficient of variance markers
         if(self.stat):
             self.tauf = compartment_param["tauf"]
             self.taus = compartment_param["taus"]
@@ -188,12 +350,13 @@ class Compartment:
         # ltp and ltd factors
         a0 =  np.sqrt(compartment_param["an"]*compartment_param["ap"])
         # we want the geometric mean of an and ap to be 1
-        self.an = torch.full((self.target.nneu,),compartment_param["an"]/a0).to(self.net.device)
+        self.an = torch.full((self.target.nneu,),compartment_param["an"]*a0).to(self.net.device)
         self.ap = torch.full((self.target.nneu,),compartment_param["ap"]/a0).to(self.net.device)
         # expected weight gain over time
         self.E_dw = torch.zeros(self.target.nneu).to(self.net.device)
-        self.dM = torch.full((self.target.nneu,),np.log(compartment_param["ap"]/compartment_param["an"])).to(self.net.device)
-        self.dN = torch.zeros(self.target.nneu).to(self.net.device)
+        self.E2_dw = torch.zeros(self.target.nneu).to(self.net.device)
+        self.dM = torch.full((self.target.nneu,),np.log(compartment_param["ap"]/compartment_param["an"]),dtype=torch.float64).to(self.net.device)
+        self.dN = torch.zeros(self.target.nneu,dtype=torch.float64).to(self.net.device)
         # local correlation
         self.C_fast = torch.zeros(self.target.nneu).to(self.net.device)
         self.C = torch.zeros(self.target.nneu).to(self.net.device)
@@ -205,26 +368,28 @@ class Compartment:
         self.CVs_fast = torch.zeros(self.target.nneu).to(self.net.device)
         self.CVs = torch.zeros(self.target.nneu).to(self.net.device)
         
+        # quantile weight estimate based on the current CV estimate
         self.wq = torch.full((self.target.nneu,),0.).to(self.net.device)
+        # current CV estimate
         self.cv = torch.full((self.target.nneu,),0.).to(self.net.device)
+        # running average and square average estimates
         self.rate_average = torch.full((self.target.nneu,),self.rate_target).to(self.net.device)
         self.rate_square = torch.full((self.target.nneu,),2*self.rate_target*self.rate_target).to(self.net.device)
-        '''
-        self.E_smooth = torch.full((self.target.nneu,),0.).to(self.net.device)
-        self.I_smooth = torch.full((self.target.nneu,),0.).to(self.net.device)
-        self.F_smooth = torch.full((self.target.nneu,),0.).to(self.net.device)
-        self.U_smooth = torch.full((self.target.nneu,),0.).to(self.net.device)
-        '''
+        # numerator and denominators for gain ratio relations and similar
         self.numerator = torch.full((self.target.nneu,),0.).to(self.net.device)
         self.denominator = torch.full((self.target.nneu,),0.).to(self.net.device)
+        # for estimates of cross correlation of the inhibitory and the excitatory input of the neuron (might be exandable to different comparment combinations at some later point)
         self.mu_E = torch.full((self.target.nneu,),0.).to(self.net.device)
         self.mu_I = torch.full((self.target.nneu,),0.).to(self.net.device)
         self.mu2_E = torch.full((self.target.nneu,),0.).to(self.net.device)
         self.mu2_I = torch.full((self.target.nneu,),0.).to(self.net.device)
+        # rate average estimates for covariance learning
         self.rate_in = torch.full((self.source.nneu,),self.rate_target).to(self.net.device)
         self.rate_out = torch.full((self.target.nneu,),self.rate_target).to(self.net.device)
+        # components needed for the spectral learning (primarily for I-I amplitudes, but the idea might be exandable to other power band steering behavior)
         self.band = cp.deepcopy(compartment_param["band"])
         self.rate_band = {}
+        # various component to track the relative ratios of power in different frequency bands. The current setup distinguishes slow, medium and fast bands and can offer target ranges for the relative power (over all bands)
         if("amplitude" in self.band):
             self.rate_band["amplitude"] = {}
             amp = self.rate_band["amplitude"]
@@ -239,63 +404,61 @@ class Compartment:
                 # go through the bands of each band variable
                 for j in ["f","m","s"]:
                     amp[i][j] = torch.zeros(self.target.nneu).to(self.net.device)
-        if("synapse" in self.band):
-            self.rate_band["synapse"] = {}
-            sizes = {"in":self.source.nneu,"out":self.target.nneu}
-            for k in ["in","out"]:
-                syn = self.rate_band["synapse"]
-                syn[k] = {}
-                syn[k]["tau"] = cp.deepcopy(self.band["synapse"][k]["tau"])
-                syn[k]["taup"] = cp.deepcopy(self.band["synapse"][k]["taup"])
-                syn[k]["theta"] = cp.deepcopy(self.band["synapse"][k]["theta"])
-                syn[k]["eta"] = cp.deepcopy(self.band["synapse"][k]["eta"])
-                # go through the band power variables
-                for i in ["r","mu","s2","p"]:
-                    syn[k][i] = {}
-                    # go through the bands of each band variable
-                    for j in ["f","m","s"]:
-                        syn[k][i][j] = torch.zeros(sizes[k]).to(self.net.device)
-        self.freq = cp.deepcopy(compartment_param["freq"])
-        self.freq_band = {}
-        for k in self.freq:
-            self.freq_band[k] = {"in": torch.full((self.source.nneu,),0,device=self.net.device), "out": torch.full((self.target.nneu,),0,device=self.net.device),"cin": torch.full((self.source.nneu,),0,device=self.net.device), "sin": torch.full((self.source.nneu,),0,device=self.net.device),"cout": torch.full((self.target.nneu,),0,device=self.net.device), "sout": torch.full((self.target.nneu,),0,device=self.net.device)}
 
+        # geometry of the input and output populations. Needed to establish initial connectivity
         target_size = torch.Size(self.target.size)
         origin_size = torch.Size(self.source.size)
-        points,self.k = sample_synapses(origin_size,target_size,compartment_param["ellipse"][0],compartment_param["ellipse"][0],math.prod(self.target.size),compartment_param["tsyn"])
+        # initial synapses per target population neuron (with fixed in-degree k for efficient gpu usage; k can be smaller than the user value if the sampling region has less synapses to randomly sample from)
+        points,self.k = sample_synapses(origin_size,target_size,compartment_param["ellipse"][0],compartment_param["ellipse"][1],math.prod(self.target.size),compartment_param["tsyn"])
+        # for matrix multiplication to quickly get the current sum of weights per target neuron
         self.ones = torch.full((self.source.nneu,),1.).to(self.net.device)
+        # total number of synapse in this compartment
         self.nsyn = self.target.nneu*self.k
-        self.inds = torch.arange(self.target.nneu).repeat_interleave(self.k).to(self.net.device)
-        self.indt = points.view(-1).to(self.net.device)
-        self.w_ind = torch.stack((self.inds,self.indt))
+        # the target indices in the target population for all synapses
+        self.indt = torch.arange(self.target.nneu).repeat_interleave(self.k).to(self.net.device)
+        # the source indices in the source population for all synapses
+        self.inds = points.view(-1).to(self.net.device)
+        # single tensor with all synapse indices
+        self.w_ind = torch.stack((self.indt,self.inds))
+        # synapse weights (are generally L1 normalized per target neuron)
         self.w = torch.zeros(self.nsyn).to(self.net.device)
-        self.band_gains = torch.full((self.nsyn,),0.).to(self.net.device)
-        self.temp_freq = torch.full((self.nsyn,),0.).to(self.net.device)
+        # temporary storage for hebb weight updates (preventing jumping in GPU VRAM)
         self.hebb = torch.zeros(self.nsyn).to(self.net.device)
+        # temporary storage for the weight updates
         self.dw = torch.zeros(self.nsyn).to(self.net.device)
         #self.w+= 1./self.k
+        # random initialization of the synapse weights
         self.w[:] = torch.exp(self.eps*torch.randn_like(self.w))
+        # adjusting the covariance learning rate so that the learning parameters are targeting relational changes in the synapse weights
         self.eta/=self.k
-        self.alpha/=self.k
-        self.nu/=self.k
+        # currently not in use
+        #self.alpha/=self.k
         #self.thetar/=self.k
-        for k in self.freq:
-            self.freq[k]["alpha"] = self.freq[k]["alpha"]/self.k
+        # The current amplitude value for each neuron in the compartment. The value is strictly positive
         self.a = torch.zeros(self.target.nneu).to(self.net.device)
         self.a+=self.A
-        self.loga = torch.zeros(self.target.nneu).to(self.net.device)
+        # amplitude learning generally happens in the log space
+        self.loga = torch.zeros(self.target.nneu,dtype=torch.float64).to(self.net.device)
         self.loga+=np.log(self.A)
+        # input rates into the target neurons from the source population
         self.lrates = torch.zeros(self.target.nneu).to(self.net.device)
+        self.lrates_buffer = torch.zeros(self.target.nneu).to(self.net.device)
+        # sparse weight matrix for this compartment
+        # We use a private weight call to overwrite the internal weights of the matrix (hence the coalesced call).
+        # There is the potential for this to break if PyTorch were to change the background call (though unlikely...)
         self.W = torch.sparse_coo_tensor(self.w_ind,self.w,size=(self.target.nneu, self.source.nneu)).coalesce().to(self.net.device)
+        # weights are coalesced to allow for quick weight updates to the weight matrix from the weight tensor
         self.w_ind[0,:] = self.W.indices()[0,:]
         self.w_ind[1,:] = self.W.indices()[1,:]
         self.w[:] = self.W.values()
+        # first weight normalizatoin. This weight normalization applies to the weight tensor and weight matrix as well
         self.normalize_weights()
-        self.SOM = compartment_param["SOM"]
-        if(self.SOM!=None):
-            self.SOM.setup(self)
+        # for experimental inhibitory SST neuron type
+        self.SST = compartment_param["SST"]
+        # GPU stream to run independent population operations in parallel and fill up the GPU better
+        self.stream = torch.cuda.Stream()
 
-
+    # Estimate of the incoming neuronal activation. Not really the rate yet, since all compartments per neuron need to be combined, and then the rectification and polynomial exponent are applied before the leaky "integration".
     def local_rate(self):
         '''
         Compute this compartment's contribution to the target population:
@@ -305,62 +468,39 @@ class Compartment:
               - a is per-target positive amplitude (homeostatic gain)
               - type is +1 (E) or -1 (I)
         '''
-        if(self.SOM!=None and self.SOM.type=="post"):
-            self.lrates[:] = self.SOM.activation()
+        if(self.SST is not None):
+            self.lrates_buffer[:] = self.SST.activation()
         else:
-            self.lrates[:] = (self.W @ self.source.rates) * self.a * self.type
+            self.lrates_buffer[:] = (self.W @ self.source.rates) * self.a * self.type
 
+    def update_lrates(self):
+        self.lrates[:] = self.lrates_buffer[:]
 
-
+    # band power estimates for updates to amplitudes (generally important for I-I amplitude learning)
     def band_update(self):
         # 
         if("amplitude" in self.rate_band):
             # frequencies should be based on firing input in a particular compartment
+            # amp is only a reference pointer to the rate band object, and thus gpu tensors
             amp =  self.rate_band["amplitude"]
             if(amp["target"] in self.target.compartments):
                 c = self.target.compartments[amp["target"]]
-                self.rate_frequencies(c.lrates,amp["r"],amp["tau"])
+                self._rate_frequencies(c.lrates,amp["r"],amp["tau"])
                 self.band_power(c.lrates,amp,amp["taup"])
             # otherwise frequencies are based on the neurons output rate
             else:
-                self.rate_frequencies(self.target.rates,amp["r"],amp["tau"])
+                self._rate_frequencies(self.target.rates,amp["r"],amp["tau"])
                 self.band_power(self.target.rates,amp,amp["taup"])
         
-        if("synapse" in self.rate_band):
-            syn = self.rate_band["synapse"]
-            # post side
-            self.rate_frequencies(self.target.rates,syn["out"]["r"],syn["out"]["tau"])
-            self.band_power(self.target.rates,syn["out"],syn["out"]["taup"])
-            # pre side
-            self.rate_frequencies(self.source.rates,syn["in"]["r"],syn["in"]["tau"])
-            self.band_power(self.source.rates,syn["in"],syn["in"]["taup"])
-
-        for k,v in self.freq_band.items():
-            freq = self.freq[k]["freq"]
-            tau = self.freq[k]["tau"]
-            cs = np.cos((self.net.time*freq)%1*2*np.pi)
-            sn = np.sin((self.net.time*freq)%1*2*np.pi)
-            v["in"][:] = (1-tau)*v["in"]+tau*self.source.rates
-            v["out"][:] = (1-tau)*v["out"]+(tau)*self.target.rates
-            v["cin"][:] = (1-tau)*v["cin"]+(tau*cs)*self.source.rates
-            v["sin"][:] = (1-tau)*v["sin"]+(tau*sn)*self.source.rates
-            v["cout"][:] = (1-tau)*v["cout"]+(tau*cs)*self.target.rates
-            v["sout"][:] = (1-tau)*v["sout"]+(tau*sn)*self.target.rates
-        
         # update the general averages, while we're at it
-        #smoothing(self.rate_square,self.target.rates*self.target.rates,self.taub)
-        #if(self.rq>0):
-        #    smoothing(self.rate_average,self.target.rates,self.tau)
-        #    smoothing(self.rate_square,self.target.rates*self.target.rates,self.taub)
-        #    smoothing(self.rate_q,(self.target.rates>self.rt*self.rate_average).float(),self.tau)
-        #else:
+
         smoothing(self.rate_average,self.target.rates,self.tau)
-        smoothing(self.rate_square,self.target.rates*self.target.rates,self.taub)
+        smoothing(self.rate_square,self.target.rates*self.target.rates,self.tau)
         smoothing(self.rate_in,self.source.rates,np.abs(self.tauin))
         smoothing(self.rate_out,self.target.rates,np.abs(self.tauout))
 
     # get the smoothing of the rates according to the target smoothing length (either multiple rates one tau, or one rate and multiple taus). This overwrites the values of the tensor(s) in rates
-    def rate_frequencies(self,rates,rate_band,tau):
+    def _rate_frequencies(self,rates,rate_band,tau):
         for i in rate_band:
             if(isinstance(tau,dict)):
                 smoothing(rate_band[i],rates,tau[i])
@@ -371,23 +511,14 @@ class Compartment:
         # get the specific frequency bands for fast, mid and slow
         LP = {"f":rates-power_band["r"]["f"],"m":power_band["r"]["f"]-power_band["r"]["m"],"s":power_band["r"]["m"]-power_band["r"]["s"]}
         # calculate the long term band averages
-        self.rate_frequencies(LP,power_band["mu"],tau)
+        self._rate_frequencies(LP,power_band["mu"],tau)
         # calculate the long term band squared averages
         for i in LP:
             LP[i][:] = LP[i]*LP[i]
-        self.rate_frequencies(LP,power_band["s2"],tau)
+        self._rate_frequencies(LP,power_band["s2"],tau)
         for i in power_band["p"]:
             power_band["p"][i][:] = smooth_variance(power_band["s2"][i],power_band["mu"][i])
 
-    def rate_stdp(self,k):
-        freq = self.freq[k]["freq"]
-        c_s = np.cos(freq*2*np.pi)
-        s_s = np.sin(freq*2*np.pi)
-        c_d = self.freq_band[k]["cin"][self.w_ind[1]]*self.freq_band[k]["cout"][self.w_ind[0]]+self.freq_band[k]["sin"][self.w_ind[1]]*self.freq_band[k]["sout"][self.w_ind[0]]
-        s_d = self.freq_band[k]["sin"][self.w_ind[1]]*self.freq_band[k]["cout"][self.w_ind[0]]-self.freq_band[k]["cin"][self.w_ind[1]]*self.freq_band[k]["sout"][self.w_ind[0]]
-        ampin = torch.sqrt(self.freq_band[k]["cin"]*self.freq_band[k]["cin"]+self.freq_band[k]["sin"]*self.freq_band[k]["sin"])
-        ampout = torch.sqrt(self.freq_band[k]["cout"]*self.freq_band[k]["cout"]+self.freq_band[k]["sout"]*self.freq_band[k]["sout"])
-        return self.freq[k]["alpha"]*torch.sign(s_d*c_s-c_d*s_s)*((4*(c_d*c_s+s_d*s_s)+ampin[self.w_ind[1]]*ampout[self.w_ind[0]])/(self.freq_band[k]["in"][self.w_ind[1]]*self.freq_band[k]["out"][self.w_ind[0]]+1e-8))
 
 
     # correlation and CV calculations
@@ -412,7 +543,7 @@ class Compartment:
 
     def amplitude_power(self):
         amp = self.rate_band["amplitude"]
-        Ptot = amp["p"]["f"]+amp["p"]["m"]+amp["p"]["s"]+1e-8
+        Ptotinv = 1./(amp["p"]["f"]+amp["p"]["m"]+amp["p"]["s"]+1e-8)
 
         # band frequencies dead bands for fast and slow bands
         #Regf1 = amp["p"]["f"]/(Ptot)<amp["theta"]["f"][0]
@@ -422,55 +553,9 @@ class Compartment:
 
         #return Regf1*amp["eta"]["f"][0] - Regf2*amp["eta"]["f"][1] - Regs1*amp["eta"]["s"][0] + Regs2*amp["eta"]["s"][1]
         # ramp to threshold approach for the band regions
-        return torch.clamp(amp["theta"]["f"][0]-amp["p"]["f"]/(Ptot),min=0)*amp["eta"]["f"][0]-torch.clamp(amp["p"]["f"]/(Ptot)-amp["theta"]["f"][1],min=0)*amp["eta"]["f"][1]-torch.clamp(amp["theta"]["s"][0]-amp["p"]["s"]/(Ptot),min=0)*amp["eta"]["s"][0]+torch.clamp(amp["p"]["s"]/(Ptot)-amp["theta"]["s"][1],min=0)*amp["eta"]["s"][1]
+        return torch.clamp(amp["theta"]["f"][0]-amp["p"]["f"]*(Ptotinv),min=0)*amp["eta"]["f"][0]-torch.clamp(amp["p"]["f"]*(Ptotinv)-amp["theta"]["f"][1],min=0)*amp["eta"]["f"][1]-torch.clamp(amp["theta"]["s"][0]-amp["p"]["s"]*(Ptotinv),min=0)*amp["eta"]["s"][0]+torch.clamp(amp["p"]["s"]*(Ptotinv)-amp["theta"]["s"][1],min=0)*amp["eta"]["s"][1]
 
-    def synaptic_band_gain(self):
-        post = self.rate_band["synapse"]["out"]
-        pre = self.rate_band["synapse"]["in"]
-        # get total power for all input and output neurons
-        ppost = post["p"]["f"]+post["p"]["m"]+post["p"]["s"]+1e-8
-        ppre = pre["p"]["f"]+pre["p"]["m"]+pre["p"]["s"]+1e-8
 
-        # post gain regions
-        Regf1 = post["p"]["f"]/(ppost)<post["theta"]["f"][0]
-        Regf2 = post["p"]["f"]/(ppost)>post["theta"]["f"][1]
-        Regs1 = post["p"]["s"]/(ppost)<post["theta"]["s"][0]
-        Regs2 = post["p"]["s"]/(ppost)>post["theta"]["s"][1]
-
-        # post gain
-        fact = (Regf1*post["eta"]["f"][0]+Regf2*post["eta"]["f"][1]+torch.logical_not(torch.logical_or(Regf1,Regf2)))*(Regs1*post["eta"]["s"][0]+Regs2*post["eta"]["s"][1]+torch.logical_not(torch.logical_or(Regs1,Regs2)))
-        sign = (Regf1|Regf2|Regs1|Regs2)
-        gpost = -fact*sign+torch.logical_not(sign)
-
-        # pre gain regions
-        Regf1 = pre["p"]["f"]/(ppre)<pre["theta"]["f"][0]
-        Regf2 = pre["p"]["f"]/(ppre)>pre["theta"]["f"][1]
-        Regs1 = pre["p"]["s"]/(ppre)<pre["theta"]["s"][0]
-        Regs2 = pre["p"]["s"]/(ppre)>pre["theta"]["s"][1]
-
-        # pre gain
-        fact = (Regf1*pre["eta"]["f"][0]+Regf2*pre["eta"]["f"][1]+torch.logical_not(torch.logical_or(Regf1,Regf2)))*(Regs1*pre["eta"]["s"][0]+Regs2*pre["eta"]["s"][1]+torch.logical_not(torch.logical_or(Regs1,Regs2)))
-        sign = (Regf1|Regf2|Regs1|Regs2)
-        gpre = fact*sign+torch.logical_not(sign)
-
-        # combine post and pre synaptic gain per synapse and return
-        return gpost[self.w_ind[0]]*gpre[self.w_ind[1]]
-
-    '''
-    def E_I_gain(self):
-        # expect all elements in I_eff < 0
-        self.E_smooth[:] = smoothing(self.E_smooth,self.target.E_eff,self.taug)
-        self.I_smooth[:] = smoothing(self.I_smooth,self.target.I_eff,self.taug)
-        return self.E_smooth/(self.E_smooth-self.I_smooth+1e-8)-self.ratio
-
-    def ff_z_score(self):
-        self.F_smooth[:] = smoothing(self.F_smooth,self.lrates,self.tauz)
-        # hopefully we checked that u_eff is clamped at zero
-        self.U_smooth[:] = smoothing(self.U_smooth,self.target.u_eff,self.tauz)
-        strong = self.F_smooth>self.thetaz
-        score = self.z_value-self.F_smooth/(self.U_smooth+1e-8)
-        return strong*score
-    '''
 
     def compartment_gain(self):
         if(self.ratio=="E/I"):
@@ -488,6 +573,12 @@ class Compartment:
         elif(self.ratio=="ueff"):
             smoothing(self.numerator,torch.abs(self.target.compartments[self.c_c[0]].lrates),self.taug)
             smoothing(self.denominator,self.target.u_eff+torch.abs(self.target.compartments[self.c_c[0]].lrates),self.taug)
+        elif(self.ratio=="supp"):
+            smoothing(self.numerator,torch.clamp(self.target.compartments[self.c_c[0]].lrates+self.target.compartments[self.c_c[1]].lrates,min=0),self.taug)
+            smoothing(self.denominator,torch.abs(self.target.compartments[self.c_c[0]].lrates),self.taug)
+        elif(self.ratio=="sparse"):
+            smoothing(self.numerator,(self.target.compartments[self.c_c[0]].lrates+self.target.compartments[self.c_c[1]].lrates)>0,self.taug)
+            smoothing(self.denominator,1,self.taug)
         else:
             smoothing(self.numerator,torch.abs(self.target.compartments[self.c_c[0]].lrates),self.taug)
             smoothing(self.denominator,torch.abs(self.target.compartments[self.c_c[0]].lrates)+torch.abs(self.target.compartments[self.c_c[1]].lrates),self.taug)
@@ -496,17 +587,19 @@ class Compartment:
         return score*strong
 
     def correlation_gain(self):
+        #inhibit = self.target.I_eff
+        inhibit = self.lrates
         smoothing(self.mu_E,self.target.E_eff,self.taug)
-        smoothing(self.mu_I,self.target.I_eff,self.taug)
+        smoothing(self.mu_I,inhibit,self.taug)
         smoothing(self.mu2_E,self.target.E_eff*self.target.E_eff,self.taug)
-        smoothing(self.mu2_I,self.target.I_eff*self.target.I_eff,self.taug)
+        smoothing(self.mu2_I,inhibit*inhibit,self.taug)
         # NMC is normalized magnitude coupling. It measures co-fluctuations as opposed to correlations (essentially the absolute coupling terms are taken)
         if(self.ratio=="NMC"):
-            smoothing(self.numerator,torch.abs((self.target.E_eff-self.mu_E)*(self.target.I_eff-self.mu_I)/((torch.sqrt(torch.clamp(self.mu2_E-self.mu_E*self.mu_E,min=0))+1e-8)*(torch.sqrt(torch.clamp(self.mu2_I-self.mu_I*self.mu_I,min=0))+1e-8))),self.taug)
+            smoothing(self.numerator,torch.abs((self.target.E_eff-self.mu_E)*(inhibit-self.mu_I)/((torch.sqrt(torch.clamp(self.mu2_E-self.mu_E*self.mu_E,min=0))+1e-8)*(torch.sqrt(torch.clamp(self.mu2_I-self.mu_I*self.mu_I,min=0))+1e-8))),self.taug)
             return self.numerator-self.z_value
 
         else:
-            smoothing(self.numerator,(self.target.E_eff-self.mu_E)*(self.target.I_eff-self.mu_I)/((torch.sqrt(torch.clamp(self.mu2_E-self.mu_E*self.mu_E,min=0))+1e-8)*(torch.sqrt(torch.clamp(self.mu2_I-self.mu_I*self.mu_I,min=0))+1e-8)),self.taug)
+            smoothing(self.numerator,(self.target.E_eff-self.mu_E)*(inhibit-self.mu_I)/((torch.sqrt(torch.clamp(self.mu2_E-self.mu_E*self.mu_E,min=0))+1e-8)*(torch.sqrt(torch.clamp(self.mu2_I-self.mu_I*self.mu_I,min=0))+1e-8)),self.taug)
             return torch.abs(self.numerator)-self.z_value
 
     def normalize_weights(self):
@@ -531,46 +624,30 @@ class Compartment:
         Amplitude a (per target) is updated in log-space:
            loga += delta * (rate_target - r_post_avg) - rho * (loga - lA0)
         """
+        # reset delta w to zero
         self.dw[:] = 0
-        fr = False
-        for i in self.freq_band:
-            if(self.freq[i]["alpha"]!=0):
-                fr = True
-        if(self.alpha!=0 or fr or self.nu!=0):
-            self.band_gains[:] = 0
-            if("synapse" in self.rate_band and self.alpha>0):
-                self.band_gains[:] = self.alpha*self.synaptic_band_gain()
 
-            self.temp_freq[:] = 0
-            for i in self.freq_band:
-                if(self.freq[i]["alpha"]>0):
-                    self.temp_freq+=self.rate_stdp(i)
-            self.dw+=(self.band_gains+self.temp_freq+self.nu*self.M)*self.target.rates[self.w_ind[0,:]]*self.source.rates[self.w_ind[1,:]]
         if(self.eta!=0):
-            # cov, hebbian and anti-hebbian like learning (a bit different for SOM)
-            if(self.SOM!=None and self.SOM.type=="pre"):
-                self.hebb[:] = self.SOM.synapse()[self.w_ind[0,:]]
+            # cov, hebbian and anti-hebbian like learning (a bit different for SST)
+            if(self.SST is not None and self.SST.type=="pre"):
+                self.hebb[:] = self.SST.synapse()[self.w_ind[0,:]]
             else:
                 if(self.tauout<0):
                      self.hebb[:] = ((self.target.rates-self.rout*self.rate_out)*self.target.rates)[self.w_ind[0,:]]
                 else:
                     self.hebb[:] = (self.target.rates-self.rout*self.rate_out)[self.w_ind[0,:]]
-            if(self.tauin<0):
-                self.hebb*=((self.source.rates-self.rin*self.rate_in)*self.source.rates)[self.w_ind[1,:]]
+            if(self.SST is not None and self.SST.type!="pre"):
+                self.hebb*=self.SST.synapse()[self.w_ind[1,:]]
             else:
-                self.hebb*=(self.source.rates-self.rin*self.rate_in)[self.w_ind[1,:]]
+                if(self.tauin<0):
+                    self.hebb*=((self.source.rates-self.rin*self.rate_in)*self.source.rates)[self.w_ind[1,:]]
+                else:
+                    self.hebb*=(self.source.rates-self.rin*self.rate_in)[self.w_ind[1,:]]
                 
             self.dw+=self.hebb*self.eta
 
-
-        
-
         # ltp and ltd adapation for large synapses
         self.dw[:]=self.an[self.w_ind[0,:]]*torch.clamp(self.dw,max=0)*(torch.pow((1+self.k*self.w)*0.5,self.bn))+self.ap[self.w_ind[0,:]]*torch.clamp(self.dw,min=0)*(torch.pow((1+self.k*self.w)*0.5,-self.bp))
-
-        # structure based noise injection. This should be used in cases where the synapse weight distribution has collapsed to all weights being equal.
-        #if(self.noise>0):
-        #    self.dw+=2*self.noise*(torch.rand_like(self.w) - 0.5)*self.w  # uniform noise between [-1, 1]
 
         # L2 regularizer + synapse turnover (because of L1 normalization of weights the form below should have a net zero weight change)
         # that means we use this as a ltp/ltd independent weight distribution regularizer
@@ -585,33 +662,26 @@ class Compartment:
         # smoothed norm calculation
         if(self.etal>0):
             # push an/ap ratio towards balanced ltp/ltd averages over all learning
+            # estimate of long term average weight drift
             smoothing(self.E_dw,row_sum(self.dw-self.w,self.w_ind[0,:]),self.taul)
-            self.dM+=self.etal*self.E_dw
-            #print(self.E_dw.mean())
-            self.ap[:] = torch.exp(-self.dM*0.5)
-            self.an[:] = torch.exp(self.dM*0.5)
+            # estimate of long term total interal weight change
+            smoothing(self.E2_dw,row_sum(torch.abs(self.dw-self.w),self.w_ind[0,:]),self.taul)
+            self.dM+=(self.etal*self.E_dw/(self.E2_dw+1e-8)).double()
+            self.ap[:] = torch.exp(-self.dM.float()*0.5)
+            self.an[:] = torch.exp(self.dM.float()*0.5)
 
         # old idea was based on using synapse sparsity as a comparison measure. We are more explicit here. We say regularization and learning should balance each other out on short timescales (even though the net effect of the regularizer on dw is zero, the important part is the effect it has on weights at the boundary to zero!)
 
-        # different approach. Since we assume log normal, we can estimate the lognormal median from CV and use that as a live threshold. 
+        # different approach. Since we assume log normal, we can estimate a lognormal wauntile from CV and use that as a live threshold. 
         if(self.etar>0):
-            # consider smoothing estimate of Neff but should be needed.
-            #self.dN+=(1/self.k*row_sum((self.w<self.thetar).float(),self.w_ind[0,:])-self.kappa)*self.etar
             # calculate cv^2+1
             self.cv[:] = row_sum(self.w*self.w,self.w_ind[0,:])*self.k
-            # threshold weight for the kappa quantile
-            self.wq[:] = (1./self.k)/torch.sqrt(self.cv)*torch.exp(torch.sqrt(torch.log(self.cv+1e-8))*self.zq)
-            self.dN[:]+=(-(self.cv<(self.thetar*self.thetar+1)).float()+(self.cv>=(self.thetar*self.thetar+1))*(row_sum((self.w<self.wq[self.w_ind[0,:]]).float(),self.w_ind[0,:])/self.k-(self.kappa+self.rq)))*self.etar
+            kinv = 1./self.k
+            # threshold weight for the kappa quantile (based on a parametrized estimation of the log normal weight given the measured cv weight)
+            self.wq[:] = kinv/torch.sqrt(self.cv)*torch.exp(torch.sqrt(torch.log(self.cv+1e-8))*self.zq)
+            self.dN[:]+=((-(self.cv<(self.thetar*self.thetar+1)).float()+(self.cv>=(self.thetar*self.thetar+1))*(row_sum((self.w<self.wq[self.w_ind[0,:]]).float(),self.w_ind[0,:])*kinv-(self.kappa+self.rq)))*self.etar).double()
             
             self.dN.clamp_(min=self.beta0)
-
-
-            '''
-            else:
-                # abuse of temporary variable hebb as a temporal weight storage
-                self.hebb = self.w*self.k-1
-                self.dw-=(self.beta/self.k)*torch.sign(self.hebb)*(torch.abs(self.hebb)**self.kappa)
-        '''
 
         # back to smoothing and renomalization
         normalize_by_row(self.dw,self.w_ind[0,:])
@@ -621,49 +691,66 @@ class Compartment:
         self.normalize_weights()
 
         # adjust compartment amplitudes
-        # balance inhbition and excitation gains
-        '''
-        if(self.gamma>0):
-            self.loga+=self.gamma*self.E_I_gain()
-        if(self.zeta>0):
-            self.loga+=self.zeta*self.ff_z_score()
-        '''
+        # either balance inhbition and excitation gains or balance band power fractions
         if(self.zeta!=0):
+            # amplitude learning based on correlation and band power
             if(self.ratio=="corr" or self.ratio=="NMC"):
-                self.denominator[:] = self.zeta*self.correlation_gain()
-                self.loga+=torch.clamp(self.denominator,min=0)+self.amplitude_power()*(self.denominator<0)
+                # correlation_gain return the difference of the absolute of the average cross correlation between E and I inputs and a target value
+                self.denominator[:] = self.correlation_gain()
+                # if the correlation between both is too high the system is over-synchronized and the compartment amplitude should be increased.
+                # Otherwise the amplitude should be adjusted to have such that its bandpower is in the proper region
+                # As a rule of thumb:
+                # very low I-I values leads to over-synchronization of E and I neurons. This needs to be corrected first
+                # If correlations are "resonable" then too much power in the high frequency band indicates too much I-I inhibition, and too little power in the low frequency band indicates to little I-I inhibition.
+                self.loga+=(self.zeta*torch.clamp(self.denominator,min=0)+self.amplitude_power()*(self.denominator<0)).double()
+            # SST neurons have some experimental slow homeostasis options. Either log-normal based distribution shaping of the target populatoin, or a PAC based theta vs gamma controller. It currently seems like standard ratio targeting of balancing the PV and SST pathways is more stable, but these options are left here in cases some one comes up with an alternative or preferable stabilization approach.Using the SST options loses control of "handtuned" SST vs PV balance, but leads to more log normal like distributions of E and/or PV population firing.
+            elif(self.SST is not None):
+                if(self.ratio=="SST" or self.ratio=="PAC"):
+                    self.SST.amplitude()
+                    # this updates numerator and denominator to be the quantile estimate of the log-normal tail
+                    self.loga+=(self.zeta*((self.z_value-self.thetaz)-self.numerator/self.denominator)).double()
+                # amplitude learning based on I-E ratios or similar
+                else:
+                    self.mu_E[:] = self.compartment_gain()
+                    self.loga+=(self.zeta*torch.clamp(self.mu_E,min=0)+self.zeta2*torch.clamp(self.mu_E,max=0)).double()
+            # amplitude learning based on I-E ratios or similar
             else:
                 self.mu_E[:] = self.compartment_gain()
-                self.loga+=self.zeta*torch.clamp(self.mu_E,min=0)+self.zeta2*torch.clamp(self.mu_E,max=0)
-            
-        #if("amplitude" in self.rate_band):
-        #    self.loga+=self.amplitude_power()
+                self.loga+=(self.zeta*torch.clamp(self.mu_E,min=0)+self.zeta2*torch.clamp(self.mu_E,max=0)).double()
+        # slow drift towards a target amplitude value
         if(self.rho>0):
-            self.loga-=self.rho*(self.loga-self.lA0)
-            # general leakage term to reduce synapse size; should generally be smaller that any other active (non-balanced) homeostasis terms
-            #self.loga-=self.rho
+            self.loga+=(self.rho*(self.lA0-self.loga)).double()
+        # average rate target based amplitude learning. Maybe numerical offset values should be parametrized at some point
         if(self.delta!=0):
-            #if(self.rq>0):
-                # should be positive for excitation
-                #self.loga+=self.delta*(torch.log(np.abs(self.cv)/(CV(self.rate_average,self.rate_square)+1e-8)))
-                #self.loga+=self.delta*(self.rate_q-self.rq)
-            #else:
-            #self.loga+=self.delta*torch.log((self.rate_target+1e-6)/(self.rate_average+1e-6))
-            self.loga+=self.delta*torch.log((self.rate_target+1e-6)/(self.rate_average+1e-6))
-            #if(self.noise>0):
-            #    self.loga+=self.delta*self.noise*(self.cv-self.CV_slow/(self.rate_average+1e-8))
-            #-0.5*torch.log(1+CV(self.rate_average,self.rate_square))
-        self.a[:] = torch.exp(self.loga)
+            self.loga+=(self.delta*torch.log((self.rate_target+1e-6)/(self.rate_average+1e-6))).double()
+        self.a[:] = torch.exp(self.loga.float())
 
+    # full object save can't handle cuda stream objects so we work around that with a save and load state that removes the stream of this class
+    def __getstate__(self):
+        """Tell pickle what to save."""
+        # Create a shallow copy of the object's dictionary
+        state = self.__dict__.copy()
+        # Remove the stream object so it doesn't block the save
+        if 'stream' in state:
+            state['stream'] = None 
+        return state
+
+    def __setstate__(self, state):
+        """Tell pickle how to restore."""
+        self.__dict__.update(state)
+        # Re-initialize a fresh stream upon loading
+        import torch
+        self.stream = torch.cuda.Stream()
+
+# EMA like sliding window
 def smoothing(tracker,input,tau):
     tracker.mul_(1 - tau).add_(tau * input)
 
+# variance like calculation with zero clamp when zero values could be achieved
 def smooth_variance(x2,x):
     return torch.clamp(x2-x*x,min=0)
 
-def CV(m,m2):
-    return torch.clamp(m2/(m*m+1e-8)-1,min=0)
-
+# row based multiplicative normalization of weights
 def normalize_by_row(W, row_idx):
     """
     W:        1D tensor of weights, shape (N,)
@@ -683,76 +770,142 @@ def normalize_by_row(W, row_idx):
     # normalize each element by its group's sum
     W /= row_sums[row_idx]
 
+# summing over all synapses per neuron (assuming fixed in degree)
 def row_sum(value,row_idx):
     row_sums = torch.zeros(row_idx.max()+1, device=value.device)
     return row_sums.index_add_(0, row_idx, value)
 
 
 
-# simplest example of a SOM neuron activation function for the output side of synaptic learning
-class SOM:
-    def __init__(self,som_type,eta_k,omega=2,rho=0.3,c=1,gamma=1):
+# simple example of a SST neuron model (can be used for target SST neurons, or source SST neurons)
+# SST neurons in this model are quite different from standard neurons
+# the activation function is (currently) based off Lp normalized input activity prior to thresholding and RePU. This is an approximation or non linear dendritic gating (not of the E signal directly, but indirectly via "reweighting" of the input signal)
+class SST:
+    def __init__(self,sst_type,target,omega=2,tau=[1,1,1,1]):
+        # p of the Lp norm
         self.omega = omega
-        self.type = som_type
-        self.c = c
-        # rho must be between 0 and 1
-        self.rho = rho
-        self.gamma = gamma
-        self.eta_k = eta_k
+        # target[0] is the excitatory input compartment that SST source neurons should target. The hebbian rule is adapted to take this a the post side of the hebbian rule as opposed to taking the output rate directly.
+        # target[1] is used for PAC calculations and gives the compartment that the SST->? pathway that the PAC should be estimated for
+        self.target = target
+        # indicates if the SST neuron is the source (pre) or target neuron (post)
+        self.type = sst_type
+        # smoothing timescales for PAC approximations
+        self.tau = cp.copy(tau)
+        for i in range(len(self.tau)):
+            self.tau[i] = 1./(1+self.tau[i])
 
     def setup(self,comp):
         self.comp = comp
-        self.avg = torch.zeros(self.comp.target.nneu).to(self.comp.net.device)
-        self.sqr = torch.zeros(self.comp.target.nneu).to(self.comp.net.device)
-        self.g = torch.zeros(self.comp.target.nneu).to(self.comp.net.device)
-        self.z = torch.zeros(self.comp.target.nneu).to(self.comp.net.device)
-        self.k = torch.zeros(self.comp.target.nneu).to(self.comp.net.device)
-        self.quantile = torch.zeros(self.comp.target.nneu).to(self.comp.net.device)
-        # get the size of the other neurons population to average their Eeff
+        # compartment of the target population the SST should be acting on
+        # we replace the target string names with the actual compartment object links at a point at which the compartments have been initialized
+        # link the target compartments for the learning rules based on the unique identifier strings.
+        self.target = [self.comp.target.compartments[self.target[0]],self.comp.target.compartments[self.target[1]]]
+        # variables for synapse learning (depends on if the SST neuron is the source or target neuron)
         if(self.type=="pre"):
-            self.avg[:] = 1.
-            self.tau = np.abs(self.comp.tauin)
-        if(self.type=="post"):
-            self.avg[:] = self.comp.source.r0*self.c
-            self.sqr = (self.avg+self.comp.source.r0)*(self.avg+self.comp.source.r0)
-            self.tau = np.abs(self.comp.tauout)
-        self.quantile[:] = self.rho
+            self.g = torch.zeros(self.comp.target.nneu).to(self.comp.net.device)
+            self.mu = torch.full((self.comp.target.nneu,),self.target[0].rate_target).to(self.comp.net.device)
+        else:
+            self.g = torch.zeros(self.comp.source.nneu).to(self.comp.net.device)
+            self.gavg = torch.full((self.comp.source.nneu,),1.).to(self.comp.net.device)
+            self.mu = torch.full((self.comp.source.nneu,),1.).to(self.comp.net.device)
         
+        # variables for amplitude calculation
+        self.mu_E = torch.zeros(self.comp.target.nneu).to(self.comp.net.device)
+        self.mu2_E = torch.zeros(self.comp.target.nneu).to(self.comp.net.device)
+        self.comp.numerator[:] = torch.full((self.comp.target.nneu,),self.comp.z_value+self.comp.thetaz).to(self.comp.net.device)
+        self.comp.denominator[:] = torch.full((self.comp.target.nneu,),1.).to(self.comp.net.device)
+        self.zq = -np.sqrt(2)*erfcinv(2*self.comp.z_value)
+        if(comp.ratio=="PAC"):
+            self.s_t = torch.full((self.comp.target.nneu,),self.target[0].rate_target).to(self.comp.net.device)
+            self.g_g = torch.full((self.comp.target.nneu,),self.target[0].rate_target).to(self.comp.net.device)
+            self.g_env = torch.full((self.comp.target.nneu,),self.target[0].rate_target).to(self.comp.net.device)
+            self.mu_s = torch.full((self.comp.target.nneu,),self.target[0].rate_target).to(self.comp.net.device)
+            self.mu_g = torch.full((self.comp.target.nneu,),self.target[0].rate_target).to(self.comp.net.device)
+            self.s_c = torch.zeros(self.comp.target.nneu).to(self.comp.net.device)
+            self.s_g = torch.zeros(self.comp.target.nneu).to(self.comp.net.device)
+            self.var_s = torch.full((self.comp.target.nneu,),2*self.target[0].rate_target*self.target[0].rate_target).to(self.comp.net.device)
+            self.var_g = torch.full((self.comp.target.nneu,),2*self.target[0].rate_target*self.target[0].rate_target).to(self.comp.net.device)
+            self.cross = torch.full((self.comp.target.nneu,),self.target[0].rate_target*self.target[0].rate_target).to(self.comp.net.device)
 
-    def zqt_gating(self,z):
-        smoothing(self.avg,z,self.tau)
-        smoothing(self.sqr,z*z,self.tau)
-        self.zq_gating(z,self.avg,torch.sqrt(torch.clamp(self.sqr-self.avg*self.avg,min=0)))
-
-    def zqx_gating(self,z):
-        self.zq_gating(z,z.mean(),z.std(unbiased=False))
-
-
-    def zq_gating(self,z,mu,sigma):
-        # z = (x-mu)/sigma
-        # g = ([z-k]_+)^gamma
-        self.g[:] = torch.clamp((z-mu)/(sigma+1e-8)-self.k,min=0)**self.gamma
-        # adapt k to approach longterm rank target
-        smoothing(self.quantile,self.g>0,self.tau)
-        self.k+=(self.quantile/self.rho-1)*self.eta_k
-
-
+    # SST neruons have a diffent type of input effect on their targets
+    # their input to a target neuron is a weighted Lp normalization of the SST input firing rates
+    # this reflects that SST neurons are considered to have a more non-linear effect on the dendritic targets.
     def activation(self):
-        self.zqt_gating((self.comp.W@(self.comp.source.rates**self.omega))**(1/self.omega))
-        return self.g*(self.comp.a*self.comp.type)
+        #self.zqt_gating((self.comp.W@(self.comp.source.rates**self.omega))**(1/self.omega),self.vars)
+        #return self.g*(self.comp.a*self.comp.type)
+        if(self.type=="pre"):
+            return self.comp.type*self.comp.a*(self.comp.W@(self.comp.source.rates**self.omega))**(1/self.omega)
+        elif(self.type=="post"):
+            smoothing(self.gavg,self.comp.source.rates,self.tau[0])
+            return self.comp.type*self.comp.a*(self.comp.W@self.gavg)
+        else:
+            smoothing(self.gavg,self.comp.source.rates,self.tau[0])
+            return (self.comp.type*self.comp.a*(self.comp.W@((self.tau[1]+self.tau[2])*self.comp.source.rates-self.tau[1]*self.gavg))).clamp_(min=0)
 
-    # here burst is the dendritic activity (model with Eeff) of the post-neuron the SOM targets. This is for synaptic learning. Inhibition is handled with the standard lrate approach based on the SOM neuron's firing.
+    # synapse weight calculations are covariance hebb like. But instead of taking the direct rates, the model works with the amount of input excitation instead. The learning rate is scaled by a long term input activity average to keep learning normalized.
     def synapse(self):
-        self.zqx_gating(self.comp.target.E_eff)
-        smoothing(self.avg,self.g,self.tau)
-        return self.g-self.avg
+        # get the 
+        if(self.type=="pre"):
+            self.g[:] = self.target[0].lrates[:]
+            tau = self.comp.tauout
+        else:
+            self.g[:] = self.gavg
+            tau = self.comp.tauin
+        smoothing(self.mu,self.g,np.abs(tau))
+        self.g[:] = (self.g-self.mu)/(self.mu+1e-8)
+        if(tau<0):
+            if(self.type=="pre"):
+                return self.g*self.comp.target.rates
+            else:
+                return self.g*self.comp.source.rates
+        else:
+            return self.g
+
+    # SST amplitudes are moved such as have the target neurons move their excitatory pre-activity to become more log normal shaped.
+    # SST->E synapses focus on neurons with "extreme" pre-activity and SST neurons themselves provide a non-linear inhibitory preactivity signal to their targets.
+    # The purpose is to smooth the E neurons activity distribution through this multi stage process
+    def amplitude(self):
+        # EMA variables to estimate target compartments excitatory input mean and variance
+        # this can still be consider local, as SST synapses would be sitting on the same dendrites where the E preactivity is being mesured
+        # SST amplitudes are moved such as have the target neurons move their excitatory pre-activity to become more log normal shaped.
+        # SST->E synapses focus on neurons with "extreme" pre-activity and SST neurons themselves provide a non-linear inhibitory preactivity signal to their targets.
+        # The purpose is to smooth the E neurons activity distribution through this multi stage process
+        if(self.comp.ratio !="PAC"):
+            smoothing(self.mu_E,torch.abs(self.target[1].lrates),self.target[1].taug)
+            smoothing(self.mu2_E,self.target[1].lrates*self.target[1].lrates,self.target[1].taug)
+            # estimate cv^2+1
+            self.g[:] = smooth_variance(self.mu2_E,self.mu_E)/(self.mu_E*self.mu_E+1e-8)+1.
+            # log normal quantile based threshold estimate based on CV and mean
+            self.g[:] = self.mu_E/torch.sqrt(self.g)*torch.exp(torch.sqrt(torch.log(self.g))*self.zq)
+            # estimate percentage of E_comp that is above the threshold
+            smoothing(self.comp.numerator,self.target[1].lrates<self.g,self.comp.taug)
+        # Otherwise we use a gamma-theta lock estimate to approach a target locking factor. Currently doesn't seem optimal as a targeting signal outside a small target range.
+        else:
+            tau_g = self.tau[0]
+            tau_e = self.tau[1]
+            tau_t = self.tau[2]
+            tau_s = self.tau[3]
+            smoothing(self.s_t,self.comp.lrates,tau_t)
+            #rg = self.target[1].lrates
+            rg = self.comp.target.rates
+            smoothing(self.g_g,rg,tau_g)
+            smoothing(self.g_env,torch.abs(rg-self.g_g),tau_e)
+            smoothing(self.mu_s,self.s_t,tau_s)
+            smoothing(self.mu_g,self.g_env,tau_s)
+            self.s_c[:] = self.s_t-self.mu_s
+            self.s_g[:] = self.g_env-self.mu_g
+            smoothing(self.var_s,self.s_c*self.s_c,tau_s)
+            smoothing(self.var_g,self.s_g*self.s_g,tau_s)
+            smoothing(self.cross,self.s_c*self.s_g,tau_s)
+            smoothing(self.comp.numerator,self.cross/(torch.sqrt(self.var_s*self.var_g)+1e-8),self.comp.taug)
+            
 
 '''
 population parameters:
 size: width, height and thickness of this neuron population
 tau: smoothing time constant of this neuron populations firing rate
 activation_exponent: exponent of the joint compartment input (0.5-1 for excitatory and 1-2 for inhibitory populations)
-baseline: minimal firing rate of the neuron (after smoothing)
+bias: negative threshold of the current  firing rate of the neuron (before smoothing)
 cap: maximal firing rate of the neuron (after smoothing)
 activation: function handle. The function should combine the local rates of each compartment in the population (by compartment id). The default in the sum of all populations. Consider using shunting populations
 (eg something like:
@@ -762,20 +915,15 @@ def shunting(u):
 )
 '''
 
-def population_parameters(id,size=[28,28,1],tau=0,rate_inflection = 50,activation_exponent=1,baseline=0,cap=300,activation=None):
+def population_parameters(id,size=[28,28,1],tau=0,rate_inflection = 50,activation_exponent=1,bias=0,cap=300,activation=None):
     parameters = {}
     parameters["id"] = id
     parameters["size"] = cp.copy(size)
     parameters["tau"] = 1./(1+tau)
     parameters["p"] = activation_exponent
     parameters["r0"] = rate_inflection
-    if (baseline<0):
-        parameters["baseline"] = 0
-    else:
-        parameters["baseline"] = baseline
-    if(cap<parameters["baseline"]):
-        print("Warning: Your firing upper limit is lower than you lower limit.")
     parameters["cap"] = cap
+    parameters["bias"] = bias
     if(activation==None):
         parameters["activation"] = default_activation
     else:
@@ -796,7 +944,7 @@ rin,rout: firing rates flipping Hebbian learning for (mainly inhibitory) synapse
 delta: amplitude learning rate
 rate_target: target long term firing average for the post synaptic neuron
 '''
-def compartment_parameters(id,source,target,ellipse=[1,1],tsyn=1,A=2,A0=-1,eta=0,etal=0,etar=0,alpha=0,nu=0,beta=0,beta0=1e-4,kappa=0,an=1,ap=1,bn=0,bp=0,c_c=None,zeta=0,zeta2="",z_value=0,thetaz=0,ratio="E/I",bands=None,rho=0,tau=0,taug=0,tauw=0,taub=0,taul=0,taur=0,thetar=0,rin=1,rout=1,tauin=1,tauout=1,rq=0,rt=1,noise=0,cv=0,delta=0,rate_target=1,eps=1,stype="",stat=False,power=None,freq=None,SOM=None):
+def compartment_parameters(id,source,target,ellipse=[1,1],tsyn=1,A=2,A0=-1,eta=0,etal=0,etar=0,alpha=0,nu=0,beta=0,beta0=1e-4,kappa=0,an=1,ap=1,bn=0,bp=0,c_c=None,zeta=0,zeta2="",z_value=0,thetaz=0,ratio="E/I",bands=None,rho=0,tau=0,taug=0,tauw=0,taub=0,taul=0,taur=0,thetar=0,rin=1,rout=1,tauin=1,tauout=1,rq=0,rt=1,noise=0,cv=0,delta=0,rate_target=1,eps=1,stype="",stat=False,power=None,freq=None,SST=None):
     parameters = {}
     parameters["id"] = id
     parameters["source"] = source
@@ -874,7 +1022,7 @@ def compartment_parameters(id,source,target,ellipse=[1,1],tsyn=1,A=2,A0=-1,eta=0
         parameters["freq"][k]["freq"] = 1./parameters["freq"][k]["period"]
         del parameters["freq"][k]["period"]
         parameters["freq"][k]["tau"] = 1./(1+parameters["freq"][k]["tau"])
-    parameters["SOM"] = SOM
+    parameters["SST"] = SST
 
     return parameters
 
@@ -910,6 +1058,10 @@ def sample_from_cylindroid(a, b, z, n, num_vectors):
 
 def sample_from_box(a, b, z, n, num_vectors):
 	vectors = []
+	if(a==0):
+		a=1
+	if(b==0):
+		b=1
 	for _ in range(num_vectors):
 		vector = torch.zeros(0,3,dtype=torch.int)
 		while len(vector) < n:
@@ -1038,26 +1190,6 @@ def sample_synapses(os,ts,a,b,n,tsyn):
 	points = sorted_blocks.view(-1)
 
 	return points,t
-
-def efficient_append_to_hdf5(file_name, dataset_name, tensor):
-    # Convert the PyTorch tensor to a NumPy array
-    data = tensor.cpu().numpy()
-
-    with h5py.File(file_name, 'a') as f:  # Open the file in append mode
-        if dataset_name in f:
-            # The dataset exists, so we'll append the new data
-            dset = f[dataset_name]
-            # Calculate the new size after appending the new data
-            new_size = dset.shape[0] + 1  # Assuming we're appending along the first dimension
-            # Resize the dataset to accommodate the new data
-            dset.resize(new_size, axis=0)
-            # Write the new data to the extended part of the dataset
-            dset[-1, :] = data
-        else:
-            # The dataset does not exist, so create it with unlimited size along the first dimension
-            dset = f.create_dataset(dataset_name, data=data[np.newaxis, :], maxshape=(None, data.shape[0]))
-
-# --- top of network.py (or wherever this code lives) ---
 
 def default_activation(u):
     """
