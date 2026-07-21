@@ -46,8 +46,11 @@ def _clone_state(net):
             state[p.id][c.id]["lrates"] = (lr.clone() if isinstance(lr, torch.Tensor)
                                             else lr.copy())
             if c.SST is not None and c.SST.type != "pre":
-                g = c.SST.gavg
-                state[p.id][c.id]["gavg"] = (g.clone() if isinstance(g, torch.Tensor)
+                g = c.SST.gs
+                state[p.id][c.id]["gs"] = (g.clone() if isinstance(g, torch.Tensor)
+                                              else g.copy())
+                g = c.SST.gf
+                state[p.id][c.id]["gf"] = (g.clone() if isinstance(g, torch.Tensor)
                                               else g.copy())
     return state
 
@@ -60,7 +63,8 @@ def _restore_state(net, state):
         for c in p.compartments.values():
             c.lrates[:] = state[p.id][c.id]["lrates"]
             if c.SST is not None and c.SST.type != "pre":
-                c.SST.gavg[:] = state[p.id][c.id]["gavg"]
+                c.SST.gs[:] = state[p.id][c.id]["gs"]
+                c.SST.gf[:] = state[p.id][c.id]["gf"]
 
 
 def _zero_state(net):
@@ -79,8 +83,11 @@ def _zero_state(net):
             state[p.id][c.id]["lrates"] = (torch.zeros_like(lr) if isinstance(lr, torch.Tensor)
                                             else np.zeros_like(lr))
             if c.SST is not None and c.SST.type != "pre":
-                g = c.SST.gavg
-                state[p.id][c.id]["gavg"] = (torch.zeros_like(g) if isinstance(g, torch.Tensor)
+                g = c.SST.gs
+                state[p.id][c.id]["gs"] = (torch.zeros_like(g) if isinstance(g, torch.Tensor)
+                                              else np.zeros_like(g))
+                g = c.SST.gf
+                state[p.id][c.id]["gf"] = (torch.zeros_like(g) if isinstance(g, torch.Tensor)
                                               else np.zeros_like(g))
     return state
 
@@ -89,7 +96,7 @@ def _zero_state(net):
 # 1. STEPPER: Raw network runner
 # ======================================================================
 class NetworkStepper:
-    def __init__(self, session, warm_up_steps, steps_per_img, cool_down_steps, n_cycles, noise,
+    def __init__(self, session, warm_up_steps, steps_per_img, cool_down_steps, n_cycles, noise,gain,
                  reset_between=False, reset_mode='loaded', preroll_images=None, device='cpu'):
         """
         reset_between : if True, the ENTIRE network's state (every
@@ -132,6 +139,7 @@ class NetworkStepper:
         self.cool_down = cool_down_steps
         self.n_cycles = n_cycles
         self.noise = noise
+        self.gain = gain
         self.reset = reset_between
         self.reset_mode = reset_mode
         self.device = device
@@ -165,19 +173,18 @@ class NetworkStepper:
         n_cycles = abs(self.n_cycles)
         for img in images:
             for cycle in range(n_cycles):
+                P.rates.zero_()
                 for _ in range(self.warm_up):
                     self.session.step()
+                temp_img = (img.flatten()*self.gain).to(self.device)
                 for t in range(self.steps):
-                    P.rates[:] = img.flatten().to(self.device)
+                    P.rates.copy_(temp_img)
                     self.session.step()
+                P.rates.zero_()
                 for t in range(self.cool_down):
-                    P.rates[:] = 0
                     self.session.step()
 
     def run(self, img, pop_ids, collect_rates=True):
-        if self.reset:
-            _restore_state(self.net, self._baseline_state)
-
         P = self.net.populations["P"]
         n_cycles = abs(self.n_cycles)
         if collect_rates:
@@ -187,14 +194,16 @@ class NetworkStepper:
         r0 = {}
         static = torch.zeros_like(img.flatten().to(self.device)).to(self.device)
         if (self.noise>0):
-            static[:] = (self.noise) * torch.randn_like(P.rates)
+            static[:] = (self.noise) * torch.randn_like(P.rates)*self.gain
         for cycle in range(n_cycles):
+            P.rates.zero_()
             for _ in range(self.warm_up):
                 self.session.step()
+            temp_img = (img.flatten()*self.gain).to(self.device)
             for t in range(self.steps):
-                P.rates[:] = img.flatten().to(self.device)
+                P.rates.copy_(temp_img)
                 if (self.noise<0):
-                    static[:] = -(self.noise) * torch.randn_like(P.rates)
+                    static.copy_(-(self.noise) * torch.randn_like(P.rates)*self.gain)
                 if(self.noise!=0):
                     P.rates+=static
                     P.rates.clamp_(min=0)
@@ -207,12 +216,12 @@ class NetworkStepper:
                         r = self.net.populations[pid].rates.detach().cpu().clone()
                         ravg = self.net.populations[pid].compartments["E_"+pid].rate_out.detach().cpu().clone()
                         tau = self.net.populations[pid].tau
-                        r = (r-(1-tau)*r0[pid])/tau
+                        r = (r-(1-tau)*r0[pid])#/tau
                         #r = torch.pow(torch.abs(r),0.25)*torch.sign(r)
                         r = torch.sign(r)*(torch.abs(r)>1e-2)
                         buffers[pid].append(r)
             for t in range(self.cool_down):
-                P.rates[:] = 0
+                P.rates.zero_()
                 if collect_rates:
                     for pid in pop_ids:
                         r0[pid] = self.net.populations[pid].rates.detach().cpu().clone()
@@ -222,7 +231,7 @@ class NetworkStepper:
                         r = self.net.populations[pid].rates.detach().cpu().clone()
                         ravg = self.net.populations[pid].compartments["E_"+pid].rate_out.detach().cpu().clone()
                         tau = self.net.populations[pid].tau
-                        r = (r-(1-tau)*r0[pid])/tau
+                        r = (r-(1-tau)*r0[pid])#/tau
                         #r = torch.pow(torch.abs(r),0.25)*torch.sign(r)
                         r = torch.sign(r)*(torch.abs(r)>1e-2)
                         buffers[pid].append(r)
@@ -230,6 +239,29 @@ class NetworkStepper:
         if not collect_rates:
             return None
         return {pid: torch.stack(buffers[pid]) for pid in pop_ids}
+
+    def run_sequence(self, img_seq, pop_ids, collect_rates=True):
+        # restore to baseline if the reset option is selected
+        if self.reset:
+            _restore_state(self.net, self._baseline_state)
+        # currently history is the only selectable option
+        for i in range(len(img_seq)):
+            if(i!=len(img_seq)-1):
+                self.run(img_seq[i], pop_ids, collect_rates=False)
+            else:
+                rates = self.run(img_seq[i], pop_ids, collect_rates=collect_rates)
+            # if we processed the first image we store the network state for later retrieval
+            if(i==0 and not self.reset):
+                self._baseline_state = _clone_state(self.net)
+        # no need to reset here for the reset case as a reset call happens at the beginning of the loop
+        # if not, we need to reset to the point after the first image was presented to the network
+        # the idea here is to be able to use mnist images sequentially and go through img_seq as a ring buffer for the upcoming images.
+        # Essentially a: what if I were to continue x images from the current and try to make a statement about this image in the past
+        if not self.reset:
+            _restore_state(self.net, self._baseline_state)
+        return rates
+                
+
 
 
 # ======================================================================
@@ -288,14 +320,15 @@ class Readout:
 
 # ----- centroid‑based readouts (unchanged) -----
 class GlobalCentroidReadout(Readout):
-    def __init__(self, metric='euclidean'):
+    def __init__(self, metric='euclidean',nclass=10):
         self.metric = metric
+        self.nclass = nclass
         self.centroids = None
 
     def fit(self, calib_features, calib_labels):
         D = calib_features[0].shape[0]
-        sums = torch.zeros(10, D, dtype=torch.float64)
-        counts = torch.zeros(10, dtype=torch.float64)
+        sums = torch.zeros(self.nclass, D, dtype=torch.float64)
+        counts = torch.zeros(self.nclass, dtype=torch.float64)
         for feat, lbl in zip(calib_features, calib_labels):
             sums[lbl] += feat.double()
             counts[lbl] += 1
@@ -313,15 +346,16 @@ class GlobalCentroidReadout(Readout):
             return int(torch.argmax(sims).item())
 
 class StackCentroidReadout(Readout):
-    def __init__(self, spatial_shape, metric='euclidean'):
+    def __init__(self, spatial_shape, metric='euclidean', nclass=10):
         self.W, self.H, self.Z = spatial_shape
         self.L = self.W * self.H
         self.metric = metric
+        self.nclass = nclass
         self.centroids = None
 
     def fit(self, calib_features, calib_labels):
-        sums = torch.zeros(self.L, 10, self.Z, dtype=torch.float64)
-        counts = torch.zeros(self.L, 10, dtype=torch.float64)
+        sums = torch.zeros(self.L, self.nclass, self.Z, dtype=torch.float64)
+        counts = torch.zeros(self.L, self.nclass, dtype=torch.float64)
         for feat, lbl in zip(calib_features, calib_labels):
             stack_feat = feat.view(self.L, self.Z)
             sums[:, lbl, :] += stack_feat.double()
@@ -343,16 +377,17 @@ class StackCentroidReadout(Readout):
         return int(torch.argmax(counts).item())
 
 class StackSoftmaxReadout(Readout):
-    def __init__(self, spatial_shape, temperature=1.0, metric='euclidean'):
+    def __init__(self, spatial_shape, temperature=1.0, metric='euclidean', nclass=10):
         self.W, self.H, self.Z = spatial_shape
         self.L = self.W * self.H
         self.temp = temperature
         self.metric = metric
+        self.nclass = nclass
         self.centroids = None
 
     def fit(self, calib_features, calib_labels):
-        sums = torch.zeros(self.L, 10, self.Z, dtype=torch.float64)
-        counts = torch.zeros(self.L, 10, dtype=torch.float64)
+        sums = torch.zeros(self.L, self.nclass, self.Z, dtype=torch.float64)
+        counts = torch.zeros(self.L, self.nclass, dtype=torch.float64)
         for feat, lbl in zip(calib_features, calib_labels):
             stack_feat = feat.view(self.L, self.Z)
             sums[:, lbl, :] += stack_feat.double()
@@ -436,7 +471,7 @@ class SklearnMLPReadout(Readout):
         return int(self.clf.predict(x)[0])
 
 class MultiCentroidReadout(Readout):
-    def __init__(self, n_centroids_per_class=5, metric='euclidean', temperature=1.0, pooling='hard'):
+    def __init__(self, n_centroids_per_class=5, metric='euclidean', nclass=10, temperature=1.0, pooling='hard'):
         """
         n_centroids_per_class : int, number of centroids to learn per class
         metric : 'euclidean' or 'cosine'
@@ -445,18 +480,19 @@ class MultiCentroidReadout(Readout):
         """
         self.K = n_centroids_per_class
         self.metric = metric
+        self.nclass = nclass
         self.temp = temperature
         self.pooling = pooling
         self.centroids = None   # will be a list of tensors, one per class, each of shape [K, D]
 
     def fit(self, calib_features, calib_labels):
         # Group features by label
-        class_feats = {i: [] for i in range(10)}
+        class_feats = {i: [] for i in range(self.nclass)}
         for feat, lbl in zip(calib_features, calib_labels):
             class_feats[lbl].append(feat.numpy())   # convert to numpy for kmeans
 
         self.centroids = []
-        for lbl in range(10):
+        for lbl in range(self.nclass):
             X = np.array(class_feats[lbl])
             if len(X) == 0:
                 # fallback: use global mean if no samples (shouldn't happen with MNIST)
@@ -498,17 +534,17 @@ class MultiCentroidReadout(Readout):
 
         # Better: compute all centroids at once and then pool
         # Concatenate all centroids: [10*K, D]
-        all_centroids = torch.cat(self.centroids, dim=0)   # [10*K, D]
+        all_centroids = torch.cat(self.centroids, dim=0)   # [nclass*K, D]
         if self.metric == 'euclidean':
-            dists = torch.cdist(x, all_centroids, p=2)     # [1, 10*K]
-            scores = -dists / self.temp                    # [1, 10*K]
+            dists = torch.cdist(x, all_centroids, p=2)     # [1, nclass*K]
+            scores = -dists / self.temp                    # [1, nclass*K]
         else:
             x_n = x / x.norm(dim=1, keepdim=True).clamp(min=1e-12)
             all_n = all_centroids / all_centroids.norm(dim=1, keepdim=True).clamp(min=1e-12)
-            scores = x_n @ all_n.T / self.temp             # [1, 10*K]
+            scores = x_n @ all_n.T / self.temp             # [1, nclass*K]
 
-        # Reshape scores to [10, K]
-        scores_per_class = scores.view(10, self.K)         # [10, K]
+        # Reshape scores to [nclass, K]
+        scores_per_class = scores.view(self.nclass, self.K)         # [nclass, K]
 
         if self.pooling == 'hard':
             # For each centroid, pick the class it belongs to (we already have class index via row)
@@ -533,50 +569,114 @@ class MultiCentroidReadout(Readout):
 # ======================================================================
 # 4. ORCHESTRATOR
 # ======================================================================
-def run_pipeline(session, calib_loader, test_loader, pop_ids,
-                 stepper, extractor, readout,
-                 n_calib, n_test, n_skip_calib=0, label="run"):
+
+def run_sequence_pipeline(session, calib_loader, test_loader, pop_ids,
+                          stepper, extractor, readout,
+                          history,x_seq, n_calib, n_test, paired, n_skip_calib=0, label="seq"):
     """
-    n_skip_calib : number of leading images in calib_loader's sequence to
-        skip before starting the real calibration loop. Used when those
-        images were already consumed elsewhere (e.g. as preroll images
-        for reset_mode='preroll'), so calibration draws a disjoint set
-        rather than re-presenting the same images twice.
+    Calibrate and test on look‑ahead sequence tasks.
+
+    history : int, number of images to look forward.
+              history=1 → standard single‑image classification.
+              history=2 → present [img_t, img_{t+1}], predict label_{t+x_seq}.
+              history=3 → present [img_t, img_{t+1}, img_{t+2}], predict label_{t+x_seq}.
     """
-    print(f"[{label}] Calibrating on {n_calib} images...")
+    print(f"[{label}] Building stream from calibration loader (history={history})...")
+
+    # ------------------------------------------------------------
+    # 1. Materialise the calibration stream as a list of (img, lbl)
+    # ------------------------------------------------------------
+    calib_stream = []
+    for imgs, lbls in calib_loader:
+        calib_stream.append((imgs[0, 0] * 255., int(lbls[0])))
+
+    # Skip the first n_skip_calib images (used for preroll, if any)
+    start_idx = n_skip_calib
+    total_calib = len(calib_stream)
+
+    # We need at least `history` images to form a complete window
+    max_start_idx = total_calib -1#- history
+    #available_windows = max(0, max_start_idx - start_idx + 1)
+    available_windows = max(0, max_start_idx+1)
+
+    # Cap the number of calibration samples
+    n_calib = min(n_calib, available_windows)
+    print(f"[{label}] Calibrating on {n_calib} windows...")
+
+    # ------------------------------------------------------------
+    # 2. Calibration loop
+    # ------------------------------------------------------------
     calib_features, calib_labels = [], []
     t0 = time.time()
-    n_seen = 0
-    for i, (imgs, lbls) in enumerate(calib_loader):
-        if i < n_skip_calib:
-            continue
-        if n_seen >= n_calib:
-            break
-        img = imgs[0, 0] * 255.
-        raw = stepper.run(img, pop_ids, collect_rates=True)
+    for i in range(0, n_calib):
+        idx = (start_idx + i) % total_calib
+        # Collect the window of images
+        img_seq = [calib_stream[(idx + j)% total_calib][0] for j in range(history)]
+
+        # Run the sequence – this uses YOUR run_sequence with clone/restore
+        raw = stepper.run_sequence(img_seq, pop_ids, collect_rates=True)
+
+        # Extract the feature from the LAST image (which now contains the whole context)
         feat = extractor.extract(raw, session)
         calib_features.append(feat)
-        calib_labels.append(int(lbls[0]))
-        n_seen += 1
-        if n_seen % 500 == 0:
-            print(f"  Calib {n_seen}/{n_calib}  {n_seen/(time.time()-t0):.1f} img/s")
-    readout.fit(calib_features, calib_labels)
-    print(f"  Calibration done in {time.time()-t0:.1f}s")
 
-    print(f"[{label}] Evaluating on {n_test} images...")
+        # The label is the x_seq'th image in the window
+        if(not paired):
+            calib_labels.append(calib_stream[(idx+x_seq)% total_calib][1])
+        else:
+            joint_label = 0
+            for step in range(x_seq+1):
+                # Grab the digit at the current step in the sequence
+                digit = calib_stream[(idx + step) % total_calib][1]
+                # Shift the existing joint_label left by one decimal place and add the new digit
+                joint_label = (joint_label * 10) + digit
+
+            calib_labels.append(joint_label)
+
+        if (idx - start_idx + 1) % 500 == 0:
+            speed = (idx - start_idx + 1) / (time.time() - t0)
+            print(f"  Calib {idx - start_idx + 1}/{n_calib}  {speed:.1f} img/s")
+
+    readout.fit(calib_features, calib_labels)
+    print(f"  Calibration done in {time.time() - t0:.1f}s")
+
+    # ------------------------------------------------------------
+    # 3. Materialise the test stream
+    # ------------------------------------------------------------
+    test_stream = []
+    for imgs, lbls in test_loader:
+        test_stream.append((imgs[0, 0] * 255., int(lbls[0])))
+
+    total_test = len(test_stream)
+    max_test_idx = total_test -1#- history
+    n_test = min(n_test, max_test_idx + 1)
+
+    print(f"[{label}] Evaluating on {n_test} windows...")
     correct = 0
     t0 = time.time()
-    for i, (imgs, lbls) in enumerate(test_loader):
-        if i >= n_test:
-            break
-        img = imgs[0, 0] * 255.
-        raw = stepper.run(img, pop_ids, collect_rates=True)
+    for i in range(n_test):
+        idx = i % total_test
+        img_seq = [test_stream[(idx + j)% total_test][0] for j in range(history)]
+        raw = stepper.run_sequence(img_seq, pop_ids, collect_rates=True)
         feat = extractor.extract(raw, session)
         pred = readout.predict(feat)
-        correct += (pred == int(lbls[0]))
-        if (i + 1) % 100 == 0:
-            acc = correct / (i + 1)
-            print(f"  Eval {i+1}/{n_test}  acc={acc:.3f}  {i/(time.time()-t0):.1f} img/s")
+        if(not paired):
+            true_label = test_stream[(idx + x_seq)% total_test][1]
+        else:
+            joint_label = 0
+            for step in range(x_seq+1):
+                # Grab the digit at the current step in the sequence
+                digit = test_stream[(idx + step) % total_test][1]
+                # Shift the existing joint_label left by one decimal place and add the new digit
+                joint_label = (joint_label * 10) + digit
+
+            true_label = joint_label
+        correct += (pred == true_label)
+
+        if (idx + 1) % 100 == 0:
+            acc = correct / (idx + 1)
+            print(f"  Eval {idx + 1}/{n_test}  acc={acc:.3f}  {idx/(time.time()-t0):.1f} img/s")
+
     return correct / n_test
 
 
@@ -646,7 +746,15 @@ def main():
     parser.add_argument("--pooling", choices=["hard","soft"], default="hard",
                         help="Pooling strategy for multi-centroid readout")
     parser.add_argument("--noise", type=float, default=0.0,
-                        help="Gaussin noise injection to the mnist digits. Value is interpreted as std. Interpreted as static noise per image is >=0 else interpreted as timevarying noise per image.")
+                        help="Gaussin noise injection to the mnist digits. Value is interpreted as std. Interpreted as static noise per image is >=0 else interpreted as time-varying noise per image.")
+    parser.add_argument("--input-gain", type=float, default=1.0,
+                        help="Amplification (or reduction) of the input signal.")
+    parser.add_argument("--history", type=int, default=1,
+                        help="Present history images and use the last image to predict the first. History of one corresponds to standard prediction.")
+    parser.add_argument("--x-seq", type=int, default=0,
+                        help="Predict the x-th image in the sequence based on the network state after history image presentations.")
+    parser.add_argument("--paired", action="store_true",
+                        help="Predict a sequence of x-seq images base on the output for the last image.")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -728,6 +836,7 @@ def main():
         steps_per_img=args.steps_per_img,
         cool_down_steps=args.cool_down,
         noise = args.noise,
+        gain = args.input_gain,
         n_cycles=args.cycles,
         reset_between=args.reset,
         reset_mode=args.reset_mode,
@@ -742,13 +851,17 @@ def main():
         "covariance": CovarianceFeature(),
     }[args.extractor]
 
+    if(args.paired):
+        nclass = 10**(args.x_seq+1)
+    else:
+        nclass = 10
     # Instantiate readout based on type
     if args.readout == "global-centroid":
-        readout = GlobalCentroidReadout(metric=args.metric)
+        readout = GlobalCentroidReadout(metric=args.metric,nclass=nclass)
     elif args.readout == "stack-centroid":
-        readout = StackCentroidReadout(spatial_shape, metric=args.metric)
+        readout = StackCentroidReadout(spatial_shape, metric=args.metric,nclass=nclass)
     elif args.readout == "stack-softmax":
-        readout = StackSoftmaxReadout(spatial_shape, temperature=args.temperature, metric=args.metric)
+        readout = StackSoftmaxReadout(spatial_shape, temperature=args.temperature, metric=args.metric,nclass=nclass)
     elif args.readout == "logistic":
         readout = SklearnLogisticReadout(C=args.C, max_iter=args.max_iter)
     elif args.readout == "svm":
@@ -758,14 +871,14 @@ def main():
     elif args.readout == "multi-centroid":
         readout = MultiCentroidReadout(
             n_centroids_per_class=args.n_centroids,
-            metric=args.metric,
+            metric=args.metric,nclass=nclass,
             temperature=args.temperature,
             pooling=args.pooling
         )
     else:
         raise ValueError(f"Unknown readout: {args.readout}")
 
-    acc = run_pipeline(
+    acc = run_sequence_pipeline(
         session=session,
         calib_loader=calib_loader,
         test_loader=test_loader,
@@ -773,6 +886,9 @@ def main():
         stepper=stepper,
         extractor=extractor,
         readout=readout,
+        history=args.history,
+        x_seq=args.x_seq,
+        paired=args.paired,
         n_calib=args.n_calib,
         n_test=args.n_test,
         n_skip_calib=n_skip_calib,
