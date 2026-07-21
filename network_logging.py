@@ -5,8 +5,6 @@
 import math
 import torch
 
-from network import row_sum
-
 def _safe_mean(x):
     """Mean with nan/inf protection."""
     return float(torch.nan_to_num(x, nan=0., posinf=0., neginf=0.).mean().item())
@@ -22,18 +20,18 @@ def log_population_stats(net):
         CV_s   = std_r / (mean_r + 1e-8)
 
         # Temporal CV estimated from first compartment's rate_average
-        r_avg = CV_t = 0.
+        r_gmean = CV_t = 0.
         if pop.compartments:
             first_c = next(iter(pop.compartments.values()))
             ra    = first_c.rate_average.detach().cpu()
-            r_avg = float(ra.mean())
-            CV_t  = float(ra.std(unbiased=False)) / (r_avg + 1e-8)
+            r_gmean = float((ra+1e-8).log().mean().exp())
+            CV_t  = float(ra.std(unbiased=False)) / (ra.mean() + 1e-8)
 
         print(
             f"Pop {pid:>3s} | "
             f"mean r = {mean_r:7.3f} | "
             f"CV_s = {CV_s:7.3f} | "
-            f"r_avg = {r_avg:7.3f} | "
+            f"r_gmean = {r_gmean:7.3f} | "
             f"CV_t ≈ {CV_t:7.3f}"
         )
     print("----------------------------------\n")
@@ -69,14 +67,14 @@ def log_compartment_stats(net):
             )
         print("--------------------------------\n")
 
-    # --- Band power and SST stats ---
-    band_or_sst = [(pid, cid, comp)
+    # --- Band power and correlation stats ---
+    band_or_corr = [(pid, cid, comp)
                    for pid, pop in net.populations.items()
                    for cid, comp in pop.compartments.items()
-                   if comp.rate_band or comp.SST is not None]
-    if band_or_sst:
+                   if comp.rate_band or comp.ratio=="corr"]
+    if band_or_corr:
         print("\n--- Band Power / SST quantiles ---")
-        for pid, cid, comp in band_or_sst:
+        for pid, cid, comp in band_or_corr:
             for band_key in ("synapse", "amplitude"):
                 if band_key not in comp.rate_band:
                     continue
@@ -89,9 +87,15 @@ def log_compartment_stats(net):
                 Ptot = Pf + Pm + Ps + 1e-8
                 print(
                     f"[{pid}:{cid:>4s}][{band_key}] "
-                    f"Pf={torch.median(Pf/Ptot):6.3f}  "
-                    f"Pm={torch.median(Pm/Ptot):6.3f}  "
-                    f"Ps={torch.median(Ps/Ptot):6.3f}"
+                    f"Pf={torch.mean(Pf/Ptot):6.3f}  "
+                    f"Pm={torch.mean(Pm/Ptot):6.3f}  "
+                    f"Ps={torch.mean(Ps/Ptot):6.3f}"
+                )
+            if(comp.ratio=="corr"):
+                corr = comp.corr.detach().cpu()
+                print(
+                    f"[{pid}:{cid:>4s}]"
+                    f"corr={torch.median(corr):6.3f}  "
                 )
         print("----------------------------------\n")
 
@@ -101,16 +105,11 @@ def log_compartment_stats(net):
         for cid, comp in pop.compartments.items():
             a    = comp.a.detach().cpu()
             w    = comp.w.detach().cpu()
-            wind = comp.w_ind[0, :].detach().cpu()
+            wind = comp.w_ind_src.detach().cpu()
             wq   = comp.wq.detach().cpu()
-
-            if comp.ratio in ("corr", "NMC"):
-                G = float(comp.numerator.median())
-            else:
-                G = float((comp.numerator / (comp.denominator + 1e-8)).median())
-
-            rat   = math.exp(-float(comp.dM.detach().cpu().median()))
-            Neff  = float((1. / comp.k * row_sum((w < wq[wind]).float(), wind)).mean())
+            G = float((comp.numerator / (comp.denominator + 1e-8)).mean())
+            rat   = math.exp(float(comp.dM.detach().cpu().median()))
+            Neff  = float((1. / comp.k * comp.row_sum((w < wq.unsqueeze(1)).float())).mean())
             bfact = math.exp(float(comp.dN.detach().cpu().median()))
             mean_a = float(a.mean())
             std_a  = float(a.std(unbiased=False))
@@ -119,10 +118,10 @@ def log_compartment_stats(net):
 
             print(
                 f"{(comp.sourceid+'-'+comp.targetid):>8s} | "
-                f"A_m = {mean_a:7.3f} | "
-                f"A_s = {std_a:12.3e} | "
+                f"A_m = {mean_a:8.3f} | "
+                f"A_cv = {std_a/(mean_a+1e-8):12.3e} | "
                 f"CV(w) = {std_w / (m_w + 1e-8):7.3f} | "
-                f"an/ap = {rat:7.5f} | "
+                f"an/ap = {rat:4.5f} | "
                 f"N = {Neff:7.5f} | "
                 f"b = {bfact:12.3e} | "
                 f"I-E = {G:7.5f}"
