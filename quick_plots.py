@@ -10,7 +10,19 @@ def data_loader(dv,pop_id,comp_id=None,field=None,field2=None,t=None,function = 
     if(field is None):
         data = dv.get_rates(pop_id,t)
     else:
-        data = dv.get_structure(pop_id,comp_id,field,t)
+        if(field=="f" or field=="m" or field=="s"):
+            f = dv.get_structure(pop_id,comp_id,"band_p_f",t)
+            m = dv.get_structure(pop_id,comp_id,"band_p_m",t)
+            s = dv.get_structure(pop_id,comp_id,"band_p_s",t)
+            tot = f+m+s
+            if(field=="f"):
+                data = f/tot
+            elif(field=="m"):
+                data = m/tot
+            else:
+                data = s/tot
+        else:
+            data = dv.get_structure(pop_id,comp_id,field,t)
     data2 = None
     if(field2 is not None and field2!=""):
         data2 = dv.get_structure(pop_id,comp_id,field2,t)
@@ -29,15 +41,48 @@ def data_loader(dv,pop_id,comp_id=None,field=None,field2=None,t=None,function = 
 def EMA_CV(x,y):
     return np.sqrt(np.maximum(y-x*x,0))/x
 
+def weight_CV(x,y):
+    x = x.reshape(*y.shape, -1)
+    return np.std(x)/np.mean(x)
+
+
 def quick_log(x,y):
-    return np.log(x+1e-9)
+    return np.log(x+1e-8)
+
+def quick_exp(x,y):
+    return np.exp(x)
 
 def id(x,y):
     return x
 
+def default(x,y):
+    return x if y is None else x/y
+
+def threshold(x,y):
+    return np.mean(x[..., None] > y.reshape(*x.shape, -1), axis=-1)
+
+def true_weights(x,y):
+    return x[...,None].repeat_interleave()*y.reshape(*x.shape,-1)
+
+def local_function(x,axis=0,name=""):
+    if name=="mean":
+        return np.mean(x,axis=axis)
+    elif name=="median":
+        return np.median(x,axis=axis)
+    elif name=="log":
+        return np.log(x+1e-8)
+    elif name=="gmean":
+        return np.exp(np.mean(np.log(x),axis=axis))
+    elif name=="exp":
+        return np.exp(x) 
+    elif name=="cv":
+        return np.std(x,axis=axis)/(np.mean(x,axis=axis)+1e-9)
+    else:
+        return x
 
 
-def structure_heatmap(dv, pop_id, title="", zmean=False, fps=5,**kwargs):
+
+def structure_heatmap(dv, pop_id, title="", lfunc="", zmean=False, fps=5,**kwargs):
     X,Y,Z = dv.get_pop_size(pop_id)
     data,t = data_loader(dv,pop_id,**kwargs)
     data = dv.reshape_spatial_data(pop_id,data)
@@ -49,16 +94,18 @@ def structure_heatmap(dv, pop_id, title="", zmean=False, fps=5,**kwargs):
         title=title,
     )
     if isinstance(t, (int, np.integer)):
+        data = local_function(data,name=lfunc)
         if zmean:
             data = np.mean(data,axis=0)
         view(data, spec = spec)
 
     else:
+        local_function(data,name=lfunc)
         if zmean:
             data = np.mean(data,axis=1)
         view(data, spec = spec, output_path="animation.mp4")
 
-def structure_histogram(dv, pop_id, title="", fps=5,hist_type="kde",**kwargs):
+def structure_histogram(dv, pop_id, title="", lfunc="", fps=5,hist_type="kde",**kwargs):
     data,t = data_loader(dv,pop_id,**kwargs)
     spec = VizSpec(
         plot_type=hist_type,
@@ -68,22 +115,20 @@ def structure_histogram(dv, pop_id, title="", fps=5,hist_type="kde",**kwargs):
         title=f"t = {t}" if isinstance(t, (int, np.integer)) else lambda i: f"t = {t[i]}"
     )
     if isinstance(t, (int, np.integer)):
-        view(data, spec = spec)
-
+        view(local_function(data,name=lfunc), spec = spec)
     else:
-        view(data, spec = spec, output_path="animation.mp4")
+        view(local_function(data,name=lfunc), spec = spec, output_path="animation.mp4")
 
 
-def time_series(dv, pop_id,title="",**kwargs):
+def time_series(dv, pop_id,title="", lfunc="",**kwargs):
     data,t = data_loader(dv,pop_id,**kwargs)
-    series = np.median(data,axis=1)
     spec = VizSpec(
         plot_type="timeseries",
         #time_values=t,
         title=title,
         ylabel="Rates",
     )
-    view(series,spec=spec)
+    view(local_function(data,name=lfunc,axis=1),spec=spec)
 
 
 
@@ -91,9 +136,11 @@ rate_ctx = RateFileContext("rates/rates.h5")
 struct_ctx = StructureFileContext("structure/structure.h5")
 conn = NetworkConnectivity("connectivity/connectivity.h5")
 dv = DataView(rate_ctx=rate_ctx,struct_ctx=struct_ctx,connectivity=conn)
-#structure_heatmap(dv,pop_id="E",comp_id="E_E",field="ravg",field2="r2avg",function=EMA_CV,t=45,fps=5,zmean=True)
-structure_histogram(dv,pop_id="E",comp_id="E_E",field="w",field2="",function=quick_log,t=229,fps=5,hist_type="histogram")
+#structure_heatmap(dv,pop_id="E",comp_id="E_E",field="a",field2="",t=slice(500,699),function=quick_log,fps=5)
+#structure_histogram(dv,pop_id="E",comp_id="E_E",field="a",field2="",t=slice(500,699),function=quick_log,fps=5,hist_type="kde")
+#structure_histogram(dv,pop_id="E",comp_id="E_E",field="w",field2="",function=quick_log,t=227,fps=5,hist_type="kde")
 nwritten = struct_ctx.n_written
-sl = slice(0,nwritten)
-#time_series(dv,pop_id="S",comp_id="E_S",field="ravg",field2="r2avg",function=EMA_CV,t=sl)
+sl = slice(1,nwritten)
+print("Number of current steps: "+str(nwritten))
+time_series(dv,pop_id="E",comp_id="E_E",field="a",field2="",function=default,lfunc="gmean",t=sl)
 #structure_heatmap(dv,"E",t=slice(100,1000),fps=5)
