@@ -28,7 +28,6 @@ def initialize_cpu_buffers(network):
                 "w":  torch.empty(comp.nsyn,        dtype=torch.float32).pin_memory(),
                 "a":  torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory(),
                 "dN": torch.empty(comp.target.nneu, dtype=torch.float64).pin_memory(),
-                "dM": torch.empty(comp.target.nneu, dtype=torch.float64).pin_memory(),
                 "numerator": torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory(),
                 "denominator": torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory(),
                 "ravg": torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory(),
@@ -36,6 +35,7 @@ def initialize_cpu_buffers(network):
                 "rhin": torch.empty(comp.source.nneu, dtype=torch.float32).pin_memory(),
                 "rhout": torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory(),
                 "wq": torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory(),
+                "corr": torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory(),
             }
             if "amplitude" in comp.rate_band:
                 for band in ["f", "m", "s"]:
@@ -114,10 +114,6 @@ def initialize_storage(file_path, network, n_snapshots):
                     shape=(n_snapshots, comp.target.nneu),
                     dtype='float64',
                     chunks=(1, comp.target.nneu))
-                comp_grp.create_dataset("dM",
-                    shape=(n_snapshots, comp.target.nneu),
-                    dtype='float64',
-                    chunks=(1, comp.target.nneu))
                 if "amplitude" in comp.rate_band:
                     for band in ["f", "m", "s"]:
                         comp_grp.create_dataset(f"band_p_{band}",
@@ -149,6 +145,10 @@ def initialize_storage(file_path, network, n_snapshots):
                     dtype='float32',
                     chunks=(1, comp.target.nneu))
                 comp_grp.create_dataset("wq",
+                    shape=(n_snapshots, comp.target.nneu),
+                    dtype='float32',
+                    chunks=(1, comp.target.nneu))
+                comp_grp.create_dataset("corr",
                     shape=(n_snapshots, comp.target.nneu),
                     dtype='float32',
                     chunks=(1, comp.target.nneu))
@@ -261,9 +261,9 @@ def save_connectivity(file_path, net):
                 # both arrays stored as int64 — int32 would be safe for
                 # current network sizes but int64 avoids any future limit
                 grp.create_dataset("indt",
-                    data=comp.w_ind[0].cpu().numpy(), dtype='int64')
+                    data=torch.arange(comp.target.nneu, device=comp.net.device).repeat_interleave(comp.k).cpu().numpy(), dtype='int64')
                 grp.create_dataset("inds",
-                    data=comp.w_ind[1].cpu().numpy(), dtype='int64')
+                    data=comp.w_ind_src.view(-1).cpu().numpy(), dtype='int64')
 
 
 # ============================================================
