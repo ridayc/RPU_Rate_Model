@@ -250,8 +250,11 @@ def _clone_state(net) -> Dict[str, object]:
             state[p.id][c.id]["lrates"] = (lr.clone() if isinstance(lr, torch.Tensor)
                                             else lr.copy())
             if c.SST is not None and c.SST.type != "pre":
-                g = c.SST.gavg
-                state[p.id][c.id]["gavg"] = (g.clone() if isinstance(g, torch.Tensor)
+                g = c.SST.gs
+                state[p.id][c.id]["gs"] = (g.clone() if isinstance(g, torch.Tensor)
+                                              else g.copy())
+                g = c.SST.gf
+                state[p.id][c.id]["gf"] = (g.clone() if isinstance(g, torch.Tensor)
                                               else g.copy())
     return state
 
@@ -263,7 +266,8 @@ def _restore_state(net, state: Dict[str, object]):
         for c in p.compartments.values():
             c.lrates[:] = state[p.id][c.id]["lrates"]
             if c.SST is not None and c.SST.type != "pre":
-                c.SST.gavg[:] = state[p.id][c.id]["gavg"]
+                c.SST.gs[:] = state[p.id][c.id]["gs"]
+                c.SST.gf[:] = state[p.id][c.id]["gf"]
 
 
 def _zero_state(net) -> Dict[str, object]:
@@ -285,8 +289,11 @@ def _zero_state(net) -> Dict[str, object]:
             state[p.id][c.id]["lrates"] = (torch.zeros_like(lr) if isinstance(lr, torch.Tensor)
                                             else np.zeros_like(lr))
             if c.SST is not None and c.SST.type != "pre":
-                g = c.SST.gavg
-                state[p.id][c.id]["gavg"] = (torch.zeros_like(g) if isinstance(g, torch.Tensor)
+                g = c.SST.gs
+                state[p.id][c.id]["gs"] = (torch.zeros_like(g) if isinstance(g, torch.Tensor)
+                                              else np.zeros_like(g))
+                g = c.SST.gf
+                state[p.id][c.id]["gf"] = (torch.zeros_like(g) if isinstance(g, torch.Tensor)
                                               else np.zeros_like(g))
     return state
 
@@ -366,7 +373,7 @@ def collect_phase_trajectories(session, images: np.ndarray, labels: np.ndarray,
 # Rate transform (applied at plot time only)
 # ============================================================
 
-def apply_transform(r: np.ndarray, mode: str) -> np.ndarray:
+def apply_transform(r: np.ndarray, mode: str, tau: Optional[float] = None) -> np.ndarray:
     if mode == "none":
         return r
     if mode == "log":
@@ -375,6 +382,31 @@ def apply_transform(r: np.ndarray, mode: str) -> np.ndarray:
         return np.log1p(np.clip(r, 0, None))
     if mode == "pow":
         return np.power(np.clip(r, 0, None),0.25)
+    if mode == "diff":
+        # Membrane-constant-adjusted step difference along the time axis
+        # (last axis): r[t] - (1 - tau) * r[t-1], where tau is the
+        # recorded population's membrane constant (net.populations[p].tau).
+        # This is the residual left after the leak term (1-tau)*r[t-1] --
+        # i.e. roughly the instantaneous drive into the neuron -- rather
+        # than a plain step-to-step delta.
+        #
+        # r[t-1] is built by shifting r right by one step and repeating
+        # the first value into the new slot (same convention as a plain
+        # prepend), so the output keeps the same length as the input:
+        # every caller can treat "diff" like any other transform without
+        # touching its step axis, phase-marking, or downstream shapes.
+        # The formula is linear/affine in r for fixed tau, so it still
+        # commutes with the mean-over-images/mean-over-Z reductions
+        # callers apply before transforming -- diff-of-mean equals
+        # mean-of-diff, so results stay consistent whether "diff" runs on
+        # raw per-neuron traces or on an already-averaged trace.
+        if tau is None:
+            raise ValueError(
+                "rate_transform='diff' requires a membrane constant tau "
+                "(pass tau=... / tau_by_pop=...)."
+            )
+        r_prev = np.concatenate([r[..., :1], r[..., :-1]], axis=-1)
+        return r - (1.0 - tau) * r_prev
     raise ValueError(f"Unknown rate transform '{mode}'")
 
 
@@ -383,6 +415,7 @@ TRANSFORM_YLABEL = {
     "log":   "log(rate)",
     "log1p": "log(1 + rate)",
     "pow":  "pow(rate)",
+    "diff": "r[t] - (1-\u03c4)\u00b7r[t-1]",
 }
 
 
@@ -434,14 +467,14 @@ def _mark_phases(ax, n_warmup: int, n_image: int, n_shutdown: int,
 def plot_per_neuron(ax, traj_loc_pop: np.ndarray, labels: np.ndarray,
                      pop_id: str, loc_label: str, transform: str,
                      n_warmup: int, n_image: int, n_shutdown: int,
-                     n_cycles: int = 1):
+                     n_cycles: int = 1, tau: Optional[float] = None):
     """
     Every (image, z) trace overlaid, colour = digit.
     traj_loc_pop shape: (n_imgs, Z, T)
     """
     n_imgs, Z, T = traj_loc_pop.shape
     steps = np.arange(T)
-    data = apply_transform(traj_loc_pop, transform)
+    data = apply_transform(traj_loc_pop, transform, tau)
     for ii in range(n_imgs):
         col = DIGIT_COLORS[labels[ii] % 10]
         for z in range(Z):
@@ -460,10 +493,44 @@ def plot_per_neuron(ax, traj_loc_pop: np.ndarray, labels: np.ndarray,
     _style(ax, f"Per-neuron rates [{pop_id}] @ {loc_label}")
 
 
+def plot_per_neuron_by_z(ax, traj_loc_pop: np.ndarray, labels: np.ndarray,
+                          pop_id: str, loc_label: str, transform: str,
+                          n_warmup: int, n_image: int, n_shutdown: int,
+                          n_cycles: int = 1, tau: Optional[float] = None):
+    """
+    Every (image, z) trace overlaid, colour = z (neuron-in-stack id).
+
+    This is the same raw data as plot_per_neuron, just recoloured: instead
+    of grouping visually by digit, traces are grouped by which z-slot in
+    the (W, H, Z) stack they came from, so you can see whether particular
+    stack positions behave differently regardless of the digit shown.
+
+    traj_loc_pop shape: (n_imgs, Z, T)
+    """
+    n_imgs, Z, T = traj_loc_pop.shape
+    steps = np.arange(T)
+    data = apply_transform(traj_loc_pop, transform, tau)
+    z_colors = plt.cm.viridis(np.linspace(0, 0.9, max(Z, 1)))
+    for ii in range(n_imgs):
+        for z in range(Z):
+            ax.plot(steps, data[ii, z], color=z_colors[z], alpha=0.25, lw=0.8)
+
+    from matplotlib.patches import Patch
+    handles = [Patch(color=z_colors[z], label=f"z={z}") for z in range(Z)]
+    ax.legend(handles=handles, fontsize=6, labelcolor=C_TXT,
+              facecolor=C_AX, edgecolor="none",
+              ncol=min(6, max(Z, 1)), loc="upper right")
+
+    _mark_phases(ax, n_warmup, n_image, n_shutdown, n_cycles)
+    ax.set_xlabel("step")
+    ax.set_ylabel(TRANSFORM_YLABEL[transform])
+    _style(ax, f"Per-neuron rates by z [{pop_id}] @ {loc_label}")
+
+
 def plot_mean_per_digit(ax, traj_loc_pop: np.ndarray, labels: np.ndarray,
                          pop_id: str, loc_label: str, transform: str,
                          n_warmup: int, n_image: int, n_shutdown: int,
-                         n_cycles: int = 1):
+                         n_cycles: int = 1, tau: Optional[float] = None):
     """
     Mean trace per digit, averaged over images and Z neurons.
     traj_loc_pop shape: (n_imgs, Z, T)
@@ -474,7 +541,7 @@ def plot_mean_per_digit(ax, traj_loc_pop: np.ndarray, labels: np.ndarray,
     for d in present:
         mask = labels == d
         mean_traj = traj_loc_pop[mask].mean(axis=(0, 1))   # (T,)
-        mean_traj = apply_transform(mean_traj, transform)
+        mean_traj = apply_transform(mean_traj, transform, tau)
         ax.plot(steps, mean_traj, color=DIGIT_COLORS[d], lw=1.8, label=str(d))
     ax.legend(fontsize=6, labelcolor=C_TXT, facecolor=C_AX, edgecolor="none",
               ncol=5, loc="upper right")
@@ -488,7 +555,7 @@ def plot_mean_per_digit(ax, traj_loc_pop: np.ndarray, labels: np.ndarray,
 def plot_mean_per_z(ax, traj_loc_pop: np.ndarray, labels: np.ndarray,
                      pop_id: str, loc_label: str, transform: str,
                      n_warmup: int, n_image: int, n_shutdown: int,
-                     n_cycles: int = 1):
+                     n_cycles: int = 1, tau: Optional[float] = None):
     """
     Mean trace per z, averaged over images and digits (i.e. pooled across
     everything except Z) — the complement of plot_mean_per_digit, which
@@ -501,10 +568,10 @@ def plot_mean_per_z(ax, traj_loc_pop: np.ndarray, labels: np.ndarray,
     z_colors = plt.cm.viridis(np.linspace(0, 0.9, max(Z, 1)))
 
     for z in range(Z):
-        mean_traj = apply_transform(traj_loc_pop[:, z, :].mean(axis=0), transform)
+        mean_traj = apply_transform(traj_loc_pop[:, z, :].mean(axis=0), transform, tau)
         ax.plot(steps, mean_traj, color=z_colors[z], lw=1.8, label=f"z={z}")
 
-    overall = apply_transform(traj_loc_pop.mean(axis=(0, 1)), transform)
+    overall = apply_transform(traj_loc_pop.mean(axis=(0, 1)), transform, tau)
     ax.plot(steps, overall, color="white", lw=1.2, ls="--", alpha=0.6,
             label="all z")
 
@@ -528,7 +595,8 @@ def _linestyle_for(idx: int) -> str:
 def plot_mean_per_digit_per_z(ax, traj_loc_pop: np.ndarray, labels: np.ndarray,
                                pop_id: str, loc_label: str, transform: str,
                                n_warmup: int, n_image: int, n_shutdown: int,
-                               color_by: str = "digit", n_cycles: int = 1):
+                               color_by: str = "digit", n_cycles: int = 1,
+                               tau: Optional[float] = None):
     """
     Mean trace per (digit, z) — averaged over images only, kept separate
     per Z. One line per combination.
@@ -549,7 +617,7 @@ def plot_mean_per_digit_per_z(ax, traj_loc_pop: np.ndarray, labels: np.ndarray,
         mask = labels == d
         # mean over images of this digit only, kept per z: (Z, T)
         mean_per_z = traj_loc_pop[mask].mean(axis=0)
-        mean_per_z = apply_transform(mean_per_z, transform)
+        mean_per_z = apply_transform(mean_per_z, transform, tau)
         for z in range(Z):
             if color_by == "digit":
                 color = DIGIT_COLORS[d % 10]
@@ -594,11 +662,13 @@ def make_figure(all_trajs: Dict, labels: np.ndarray,
                  probe_xy: List[Tuple[int, int]],
                  n_warmup: int, n_image: int, n_shutdown: int,
                  save_path: str, transform: str = "none",
-                 color_by: str = "digit", n_cycles: int = 1):
+                 color_by: str = "digit", n_cycles: int = 1,
+                 tau_by_pop: Optional[Dict[str, float]] = None):
 
     pop_ids = list(all_trajs.keys())
-    n_rows = 4  # per-neuron / mean-per-digit / mean-per-digit-per-z / mean-per-z
+    n_rows = 5  # per-neuron(digit) / per-neuron(z) / mean-per-digit / mean-per-digit-per-z / mean-per-z
     n_cols = len(pop_ids)  # one column per population (E, [I], ...)
+    tau_by_pop = tau_by_pop or {}
 
     for li, (cx, cy) in enumerate(probe_xy):
         loc_label = f"({cx},{cy})"
@@ -612,15 +682,18 @@ def make_figure(all_trajs: Dict, labels: np.ndarray,
 
         for ci, p in enumerate(pop_ids):
             t = all_trajs[p][:, li, :, :]   # (n_imgs, Z, T)
+            tau = tau_by_pop.get(p)
             plot_per_neuron(axes[0][ci], t, labels, p, loc_label, transform,
-                             n_warmup, n_image, n_shutdown, n_cycles)
-            plot_mean_per_digit(axes[1][ci], t, labels, p, loc_label, transform,
-                                 n_warmup, n_image, n_shutdown, n_cycles)
-            plot_mean_per_digit_per_z(axes[2][ci], t, labels, p, loc_label,
+                             n_warmup, n_image, n_shutdown, n_cycles, tau)
+            plot_per_neuron_by_z(axes[1][ci], t, labels, p, loc_label, transform,
+                                  n_warmup, n_image, n_shutdown, n_cycles, tau)
+            plot_mean_per_digit(axes[2][ci], t, labels, p, loc_label, transform,
+                                 n_warmup, n_image, n_shutdown, n_cycles, tau)
+            plot_mean_per_digit_per_z(axes[3][ci], t, labels, p, loc_label,
                                        transform, n_warmup, n_image, n_shutdown,
-                                       color_by, n_cycles)
-            plot_mean_per_z(axes[3][ci], t, labels, p, loc_label, transform,
-                             n_warmup, n_image, n_shutdown, n_cycles)
+                                       color_by, n_cycles, tau)
+            plot_mean_per_z(axes[4][ci], t, labels, p, loc_label, transform,
+                             n_warmup, n_image, n_shutdown, n_cycles, tau)
 
         fig.patch.set_facecolor(C_BG)
         cycle_note = f", cycles={n_cycles}" if n_cycles != 1 else ""
@@ -717,9 +790,28 @@ def plot_phase_trajectories(
         reset_mode=reset_mode)
 
     os.makedirs(output_dir, exist_ok=True)
+
+    tau_by_pop = {}
+    for p in pop_ids:
+        tau_p = net.populations[p].tau
+        # tau may be a scalar, a numpy/torch scalar, or a per-neuron
+        # tensor/array on some networks -- apply_transform's diff mode
+        # broadcasts a python float against the whole (n_imgs, Z, T)
+        # trace, so reduce anything array-like to a single representative
+        # value (its mean) rather than assuming a single scalar exists.
+        if isinstance(tau_p, torch.Tensor):
+            tau_p = float(tau_p.float().mean().item())
+        elif isinstance(tau_p, np.ndarray):
+            tau_p = float(tau_p.mean())
+        else:
+            tau_p = float(tau_p)
+        tau_by_pop[p] = tau_p
+    print(f"  Membrane tau     : {tau_by_pop}")
+
     make_figure(all_trajs, labels, probe_xy,
                 n_warmup_steps, n_image_steps, n_shutdown_steps,
-                output_dir, rate_transform, color_by, n_cycles)
+                output_dir, rate_transform, color_by, n_cycles,
+                tau_by_pop=tau_by_pop)
 
     return dict(trajs=all_trajs, labels=labels, probe_xy=probe_xy)
 
@@ -761,9 +853,13 @@ if __name__ == "__main__":
                              "population, which is never plotted).  "
                              "Default: E, plus I if present.")
     parser.add_argument("--rate-transform", type=str, default="none",
-                        choices=["none", "log", "log1p", "pow"],
+                        choices=["none", "log", "log1p", "pow", "diff"],
                         help="Transform applied to rates before plotting "
-                             "(computed at plot time, not during recording).")
+                             "(computed at plot time, not during recording). "
+                             "'diff' plots r[t] - (1-tau)*r[t-1] instead of "
+                             "the rate itself, where tau is each recorded "
+                             "population's membrane constant "
+                             "(net.populations[p].tau).")
     parser.add_argument("--color-by", type=str, default="digit",
                         choices=["digit", "z"],
                         help="In the 'mean per digit, per z' panel: which "
@@ -787,6 +883,11 @@ if __name__ == "__main__":
              "state the network was in when this script loaded it, "
              "reused for every image. 'fresh': everything zeroed for "
              "every image."
+    )
+    parser.add_argument(
+        "--denoise",
+        action="store_true",
+        help="Remove noise bias inherent to the network populations"
     )
     parser.add_argument("--output-dir", type=str, default="./phase_out",
                         help="Directory for output figures.")
