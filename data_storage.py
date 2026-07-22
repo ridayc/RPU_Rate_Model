@@ -28,6 +28,7 @@ def initialize_cpu_buffers(network):
                 "w":  torch.empty(comp.nsyn,        dtype=torch.float32).pin_memory(),
                 "a":  torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory(),
                 "dN": torch.empty(comp.target.nneu, dtype=torch.float64).pin_memory(),
+                "dM": torch.empty(comp.target.nneu, dtype=torch.float64).pin_memory(),
                 "numerator": torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory(),
                 "denominator": torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory(),
                 "ravg": torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory(),
@@ -111,6 +112,10 @@ def initialize_storage(file_path, network, n_snapshots):
                 # accumulators where float32 precision is insufficient
                 # due to timescale separation (see network.py)
                 comp_grp.create_dataset("dN",
+                    shape=(n_snapshots, comp.target.nneu),
+                    dtype='float64',
+                    chunks=(1, comp.target.nneu))
+                comp_grp.create_dataset("dM",
                     shape=(n_snapshots, comp.target.nneu),
                     dtype='float64',
                     chunks=(1, comp.target.nneu))

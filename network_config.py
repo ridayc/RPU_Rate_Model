@@ -61,6 +61,7 @@ def make_learning_params(scale=0.1):
     # --- Global scale ---
     p["SCALE"] = scale
     p["SLOW"] = 0.1
+    p["FAST"] = 0.1
     slow = p["SLOW"]
     cv = 2.5
     cv = cv**3
@@ -73,7 +74,7 @@ def make_learning_params(scale=0.1):
     # All tau values are converted to smoothing constants 1/(1+tau) inside
     # compartment_parameters, so these are expressed in natural step units.
     p["TAU_CALC"]     = 1000
-    p["TAU_SYN"]      = 50/scale
+    p["TAU_SYN"]      = 100/scale
     p["AVG_TAU"]      = 900/scale/slow             # long-term average for amplitudes/covariance
     
     p["TAU_BCM"]      = 20/slow              # short-term BCM facilitation/suppression
@@ -82,10 +83,10 @@ def make_learning_params(scale=0.1):
     p["TAU_HOMEO_I"]  = 90/scale        # homeostatic timescale for I populations (slower)
     p["TAU_HOMEO_S"]  = p["TAU_HOMEO_I"]         # homeostatic timescale for I populations (slower)
     p["TAU_SLOW"]     = p["TAU_HOMEO_I"]
-    p["TAUL_E"]       = p["TAU_SYN"]/10            # LTP/LTD balance averaging window
+    p["TAUL_E"]       = p["TAU_SYN"]/p["FAST"]            # LTP/LTD balance averaging window
     p["TAUL_I"]       = p["TAUL_E"]
     p["TAUL_S"]       = p["TAUL_I"]
-    p["TAUL_P"]       = p["TAUL_E"]*10
+    p["TAUL_P"]       = p["TAUL_E"]
 
     # --- Amplitude learning rates ---
     # Expressed as total fractional change per TAU_HOMEO steps, then
@@ -126,7 +127,7 @@ def make_learning_params(scale=0.1):
     # If E-E is too weak selectivity is reduced because inhibition too quickly erases all established E-E connectivity structure
     BASE = frac / p["TAU_SYN"] * (1 + p["TAUW"])
     p["LR_EE"] =  1.   * BASE
-    p["LR_EI"] =  2.   * BASE
+    p["LR_EI"] =  -2.   * BASE
     p["LR_ES"] =  0.05  * BASE
     p["LR_IE"] =  0.2  * BASE
     p["LR_II"] =  0.2  * BASE
@@ -137,29 +138,29 @@ def make_learning_params(scale=0.1):
     p["LR_PE"] = 0.01   * BASE
 
     # weight distribution regularizer (dN)
-    p["REG_P"]   = 0.1 / p["TAUL_P"] /kq    # weight distribution regularizer P
-    p["REG_E"]   = 0.1 / p["TAUL_E"] /kq    # weight distribution regularizer E
-    p["REG_I"]   = 0.1 / p["TAUL_I"] /kq    # weight distribution regularizer I
-    p["REG_S"]   = 0.1 / p["TAUL_S"] /kq    # weight distribution regularizer S
+    p["REG_P"]   = 0.01 /kq    # weight distribution regularizer P
+    p["REG_E"]   = 0.01 /kq    # weight distribution regularizer E
+    p["REG_I"]   = 0.01 /kq    # weight distribution regularizer I
+    p["REG_S"]   = 0.01 /kq    # weight distribution regularizer S
 
-    p["TAU_E"]        = 5
-    p["TAU_I"]        = 2
+    p["TAU_E"]        = 5.
+    p["TAU_I"]        = 2.
     p["TAU_COV_OUT"]  = p["TAU_SYN"]*10            # covariance learning average window on the post synaptic side
     p["TAU_COV_IN"]   = p["TAU_SYN"]*10
     p["TAU_ELIG_E"]   = p["TAU_SYN"]*10
     p["TAU_ELIG_I"]   = 10
-    p["TCO_PE"]       = p["TAU_E"] 
-    p["TCI_PE"]       = p["TAU_E"]*2 
-    p["TCO_EE"]       = p["TAU_E"]
-    p["TCI_EE"]       = p["TAU_E"]*2 
-    p["TCO_EI"]       = p["TAU_I"] 
-    p["TCI_EI"]       = p["TAU_E"]*2
+    p["TCO_PE"]       = p["TAU_E"]*40 
+    p["TCI_PE"]       = p["TAU_E"]*20 
+    p["TCO_EE"]       = p["TAU_E"]*2
+    p["TCI_EE"]       = p["TAU_E"]*1
+    p["TCO_EI"]       = p["TAU_I"]*1 
+    p["TCI_EI"]       = p["TAU_E"]*1
     p["TCO_ES"]       = p["TAU_COV_OUT"]
     p["TCI_ES"]       = p["TAU_COV_IN"]
-    p["TCO_IE"]       = p["TAU_I"]*-2
-    p["TCI_IE"]       = p["TAU_E"]
-    p["TCO_II"]       = p["TAU_I"]
-    p["TCI_II"]       = p["TAU_I"]*2
+    p["TCO_IE"]       = p["TAU_E"]*1
+    p["TCI_IE"]       = p["TAU_E"]*-1
+    p["TCO_II"]       = p["TAU_I"]*4
+    p["TCI_II"]       = p["TAU_I"]*4
     p["TCO_IS"]       = p["TAU_COV_OUT"]
     p["TCI_IS"]       = p["TAU_COV_IN"]
     p["TCO_SE"]       = -p["TAU_COV_OUT"]
@@ -174,7 +175,7 @@ def make_learning_params(scale=0.1):
 
     # --- LTP/LTD asymmetry exponents ---
     # bn/bp control how strongly large weights are penalized during depression/potentiation
-    p["BN_PE"] = 0.5;  p["BP_PE"] = 0.5 #0.25,0.25?
+    p["BN_PE"] = 0.25;  p["BP_PE"] = 0.25 #0.25,0.25?
     # excitatory exponent likely has to compensate for the rate exponent of the E population (which is also reflected in the I rates)
     p["BN_EE"] = 0.5;  p["BP_EE"] = 0.5
     p["BN_EI"] = 0.5;  p["BP_EI"] = 0.5
@@ -241,7 +242,7 @@ def make_populations(size_E, frac_i=0.28):
 
     # Characteristic firing rates (inflection point of RePU nonlinearity)
     r0E = 1.0
-    r0I = 6.0
+    r0I = 10.0
     r0S = 4.0
 
     bias = 0.001
@@ -417,7 +418,7 @@ def make_compartments(lp, pop, r0):
         thetaz=A_PE * in_rec * 20.*0, z_value=in_rec,
         ratio="gain", c_c=["P_E","E_E"],
         zeta=DELTA_E*0.05,   # normalized by ff input fraction
-        rin=1., rout=0., tauin=lp["TCI_PE"] , tauout=lp["TCO_PE"] ,
+        rin=1., rout=1., tauin=lp["TCI_PE"] , tauout=lp["TCO_PE"] ,
         delta=0.,           # no rate-target amp learning on ff input
         rate_target=r0E, eps=2.,
     )
@@ -441,7 +442,7 @@ def make_compartments(lp, pop, r0):
         tau=t_calc*1, tauw=TAUW, taug=t_calc*1, taub=TAU_HOMEO_E,
         #zeta=-DELTA_E*1, z_value=r0E*0.4*0.6, ratio="E2",c_c=["E_I","E_I"],
         rin=1., rout=0., tauin=lp["TCI_EE"] , tauout=lp["TCO_EE"] ,
-        delta=DELTA_E*0.2, rate_target=r0E, eps=1.,
+        delta=DELTA_E*1., rate_target=r0E, eps=1.,
         stat=False,
         power={"tauf": TAU_BCM, "taus": TAU_SLOW},
         SST=SST(sst_type="E",target=["E_E","E_E"], omega=2, tau=[12,0.4,200,0.6]),
@@ -543,7 +544,7 @@ def make_compartments(lp, pop, r0):
         z_value=0.5, ratio="gain", c_c=["E_I","I_I"],thetaz=0,
         #z_value=0.25, ratio="sparse", c_c=["E_I","I_I"],thetaz=0,
         #zeta=-DELTA_E*10, taug=t_calc, z_value=1., ratio="corr",c_c=["E_I","I_I"],
-        rin=1., rout=0., tauin=lp["TCI_II"] , tauout=lp["TCO_II"] ,
+        rin=1., rout=1., tauin=lp["TCI_II"] , tauout=lp["TCO_II"] ,
         delta=0., rate_target=r0I, eps=1.,
         SST=SST(sst_type="PV",target=["I_I","I_I"], omega=2, tau=[6,0.7,100,0.1]),
         bands=I_I_band,

@@ -228,6 +228,7 @@ class Population:
                 buf["w"].copy_(comp.w.view(-1), non_blocking=True)
                 buf["a"].copy_(comp.a, non_blocking=True)
                 buf["dN"].copy_(comp.dN, non_blocking=True)
+                buf["dM"].copy_(comp.dM, non_blocking=True)
                 buf["numerator"].copy_(comp.numerator, non_blocking=True)
                 buf["denominator"].copy_(comp.denominator, non_blocking=True)
                 buf["ravg"].copy_(comp.rate_average, non_blocking=True)
@@ -539,17 +540,17 @@ class Compartment:
         smoothing(self.H,(self.weight_multiply(self.source.rates-self.rjt))*(self.target.rates-self.rit),self.tauf)
         self.sigi.copy_(torch.sqrt(torch.clamp(self.ri2t-self.rit*self.rit,min=0)))
         self.sigj.copy_(torch.sqrt(torch.clamp(self.rj2t-self.rjt*self.rjt,min=0)))
-        self.C_fast.copy_(self.H/(self.sigi*(self.weight_multiply(self.sigj))+1e-8))
+        self.C_fast.copy_(self.H/(self.sigi*(self.weight_multiply(self.sigj))+1e-6))
         smoothing(self.C,self.C_fast,self.taus)
         smoothing(self.C2,torch.abs(self.C_fast),self.taus)
-        self.CVt_fast.copy_(torch.sqrt(torch.clamp(self.ri2t/(self.rit*self.rit+1e-8)-1,min=0)))
+        self.CVt_fast.copy_(torch.sqrt(torch.clamp(self.ri2t/(self.rit*self.rit+1e-6)-1,min=0)))
         smoothing(self.CVt,self.CVt_fast*self.rit,self.taus)
-        self.CVs_fast.copy_(torch.sqrt(torch.clamp((self.r2s+1e-9)/(self.rs*self.rs+1e-8)-1,min=0)))
+        self.CVs_fast.copy_(torch.sqrt(torch.clamp((self.r2s+1e-9)/(self.rs*self.rs+1e-6)-1,min=0)))
         smoothing(self.CVs,self.CVs_fast,self.taus)
 
     def amplitude_power(self):
         amp = self.rate_band["amplitude"]
-        self.scratch.copy_(1./(amp["p"]["f"]+amp["p"]["m"]+amp["p"]["s"]+1e-8))
+        self.scratch.copy_(1./(amp["p"]["f"]+amp["p"]["m"]+amp["p"]["s"]+1e-6))
         Ptotinv = self.scratch
 
         # band frequencies dead bands for fast and slow bands
@@ -594,7 +595,7 @@ class Compartment:
             #smoothing(self.denominator,torch.abs(self.target.compartments[self.c_c[0]].lrates)+torch.abs(self.target.compartments[self.c_c[1]].lrates),self.taug)
             smoothing(self.numerator,torch.abs(self.target.compartments[self.c_c[0]].lrates),self.taug)
             smoothing(self.denominator,torch.abs(self.target.compartments[self.c_c[1]].lrates),self.taug)
-        return self.z_value-self.numerator/(self.denominator+1e-8)
+        return self.z_value-self.numerator/(self.denominator+1e-6)
 
     def correlation_gain(self):
         #inhibit = self.target.I_eff
@@ -603,7 +604,7 @@ class Compartment:
         smoothing(self.mu_I,inhibit,self.taug)
         smoothing(self.mu2_E,self.target.E_eff*self.target.E_eff,self.taug)
         smoothing(self.mu2_I,inhibit*inhibit,self.taug)
-        smoothing(self.corr,(self.target.E_eff-self.mu_E)*(inhibit-self.mu_I)/((torch.sqrt(torch.clamp(self.mu2_E-self.mu_E*self.mu_E,min=0))+1e-8)*(torch.sqrt(torch.clamp(self.mu2_I-self.mu_I*self.mu_I,min=0))+1e-8)),self.taug)
+        smoothing(self.corr,(self.target.E_eff-self.mu_E)*(inhibit-self.mu_I)/((torch.sqrt(torch.clamp(self.mu2_E-self.mu_E*self.mu_E,min=0))+1e-6)*(torch.sqrt(torch.clamp(self.mu2_I-self.mu_I*self.mu_I,min=0))+1e-6)),self.taug)
         return torch.abs(self.corr)-self.thetaz
 
     def normalize_weights(self):
@@ -650,9 +651,8 @@ class Compartment:
             # cov, hebbian and anti-hebbian like learning (a bit different for SST)
             if(self.SST is not None and self.SST.type!="pre"):
                 self.dw.copy_(self.SST.synapse()*self.eta)
-            
-            if(self.SST is not None and self.SST.type=="pre"):
-                self.dw_copy_(self.SST.synapse()*eta)
+            elif(self.SST is not None and self.SST.type=="pre"):
+                self.dw_copy_(self.SST.synapse()*self.eta)
             else:
                 self.dw.copy_(self.cross_rule(self.target.rates,self.source.rates,self.rate_out,self.rate_in)*self.eta)             
 
@@ -701,7 +701,7 @@ class Compartment:
             self.cv.copy_(self.row_sum(self.w*self.w)*self.k)
             kinv = 1./self.k
             # threshold weight for the kappa quantile (based on a parametrized estimation of the log normal weight given the measured cv weight)
-            self.wq.copy_(kinv/torch.sqrt(self.cv)*torch.exp(torch.sqrt(torch.log(self.cv+1e-8))*self.zq))
+            self.wq.copy_(kinv/torch.sqrt(self.cv)*torch.exp(torch.sqrt(torch.log(self.cv+1e-6))*self.zq))
             cv_low = self.cv<(self.thetar*self.thetar+1)
             cv_relax = torch.logical_not(cv_low)
             self.dN.add_(((-cv_low.float()+cv_relax.float()*(self.row_sum((self.w<self.wq.unsqueeze(1)).float())*kinv-(self.kappa+self.rq)))*self.etar*self.E2_dw).double())
@@ -813,7 +813,7 @@ class Compartment:
         torch.sum(W, dim=1, out=self.scratch)
         
         # 3. Clamp the scratchpad in-place
-        self.scratch.clamp_(min=1e-12)
+        self.scratch.clamp_(min=1e-8)
         
         # 4. Use unsqueeze(1) as a zero-allocation VIEW to allow broadcasting
         W.div_(self.scratch.unsqueeze(1))
@@ -844,8 +844,13 @@ class Compartment:
         return torch.sum(self.dw, dim=1)
 
     def cross_rule(self,yi,xj,yavg,xavg):
-        if(self.tauin>0):
-            return (self.ap*yi).unsqueeze(1)*xavg[self.w_ind_src]-(self.an*yavg).unsqueeze(1)*xj[self.w_ind_src]
+        if(self.rout>0):
+            return (self.ap*yi).unsqueeze(1)*xj[self.w_ind_src]-(self.an*yavg).unsqueeze(1)*xavg[self.w_ind_src]
+        elif(self.tauin>0):
+            if(self.eta>0):
+                return (self.ap*yi).unsqueeze(1)*xavg[self.w_ind_src]-(self.an*yavg).unsqueeze(1)*xj[self.w_ind_src]
+            else:
+                return (self.an*yi).unsqueeze(1)*xavg[self.w_ind_src]-(self.ap*yavg).unsqueeze(1)*xj[self.w_ind_src]
         else:
             return (self.ap*yi-self.an).unsqueeze(1)*xavg[self.w_ind_src]
 
@@ -916,7 +921,7 @@ class SST:
     def synapse(self):
         # get the 
         if(self.type=="pre"):
-            self.g.copy_(self.target[0].lrates/(self.comp.a+1e-8))
+            self.g.copy_(self.target[0].lrates/(self.comp.a+1e-6))
             tau = self.comp.tauout
             smoothing(self.mu,self.g,np.abs(tau))
             return self.comp.cross_rule(self.g,self.comp.source.rates,self.mu,self.comp.rate_in)
