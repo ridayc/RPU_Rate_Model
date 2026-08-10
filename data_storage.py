@@ -29,17 +29,20 @@ def initialize_cpu_buffers(network):
                 "a":  torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory(),
                 "dN": torch.empty(comp.target.nneu, dtype=torch.float64).pin_memory(),
                 "dM": torch.empty(comp.target.nneu, dtype=torch.float64).pin_memory(),
+                "E_dw": torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory(),
+                "E2_dw": torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory(),
                 "numerator": torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory(),
                 "denominator": torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory(),
                 "ravg": torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory(),
                 "r2avg": torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory(),
                 "rhin": torch.empty(comp.source.nneu, dtype=torch.float32).pin_memory(),
                 "rhout": torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory(),
-                "wq": torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory(),
+                "wql": torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory(),
+                "wqu": torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory(),
                 "corr": torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory(),
             }
             if "amplitude" in comp.rate_band:
-                for band in ["f", "m", "s"]:
+                for band in ["u","f", "m", "s"]:
                     cpu_buffers[pop.id][comp.id][f"band_p_{band}"] = (
                         torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory()
                     )
@@ -119,8 +122,16 @@ def initialize_storage(file_path, network, n_snapshots):
                     shape=(n_snapshots, comp.target.nneu),
                     dtype='float64',
                     chunks=(1, comp.target.nneu))
+                comp_grp.create_dataset("E_dw",
+                    shape=(n_snapshots, comp.target.nneu),
+                    dtype='float32',
+                    chunks=(1, comp.target.nneu))
+                comp_grp.create_dataset("E2_dw",
+                    shape=(n_snapshots, comp.target.nneu),
+                    dtype='float32',
+                    chunks=(1, comp.target.nneu))
                 if "amplitude" in comp.rate_band:
-                    for band in ["f", "m", "s"]:
+                    for band in ["u","f", "m", "s"]:
                         comp_grp.create_dataset(f"band_p_{band}",
                             shape=(n_snapshots, comp.target.nneu),
                             dtype='float32',
@@ -149,7 +160,11 @@ def initialize_storage(file_path, network, n_snapshots):
                     shape=(n_snapshots, comp.target.nneu),
                     dtype='float32',
                     chunks=(1, comp.target.nneu))
-                comp_grp.create_dataset("wq",
+                comp_grp.create_dataset("wql",
+                    shape=(n_snapshots, comp.target.nneu),
+                    dtype='float32',
+                    chunks=(1, comp.target.nneu))
+                comp_grp.create_dataset("wqu",
                     shape=(n_snapshots, comp.target.nneu),
                     dtype='float32',
                     chunks=(1, comp.target.nneu))

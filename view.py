@@ -93,7 +93,7 @@ def _compute_global_crop(data, spec):
         # Find rows and cols where any positive value exists
         # Reshape to (..., H, W) and collapse all leading dims
         # Use np.any over all leading dimensions
-        pos_mask = (data > 0)
+        pos_mask = (data != 0)
         # Collapse all dimensions except the last two
         while pos_mask.ndim > 2:
             pos_mask = np.any(pos_mask, axis=0)

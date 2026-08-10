@@ -27,14 +27,14 @@ from network_session import build_session, session_arg_parser
 # Mirrors the fix applied to phase_trajectory_plot.py: a population's
 # .rates is NOT the only stateful variable that can carry information
 # from one trial into the next. Each compartment also keeps an `lrates`
-# buffer and (where present) an `SST.gavg` running average. If only
+# buffer and (where present) an `SST.gs/gf` running average. If only
 # `.rates` is reset between images, those other variables keep
 # accumulating image-to-image, which silently leaks information about
 # every prior image into what is supposed to be an independent trial.
 
 def _clone_state(net):
     """Snapshot every population's rates plus every compartment's
-    lrates and SST.gavg (where present), across the whole network."""
+    lrates and SST.gs/gf (where present), across the whole network."""
     state = {}
     for p in net.populations.values():
         state[p.id] = {}
@@ -59,17 +59,17 @@ def _restore_state(net, state):
     """Write a snapshot produced by _clone_state / _zero_state back into
     the network."""
     for p in net.populations.values():
-        p.rates[:] = state[p.id]["rates"]
+        p.rates.copy_(state[p.id]["rates"])
         for c in p.compartments.values():
-            c.lrates[:] = state[p.id][c.id]["lrates"]
+            c.lrates.copy_(state[p.id][c.id]["lrates"])
             if c.SST is not None and c.SST.type != "pre":
-                c.SST.gs[:] = state[p.id][c.id]["gs"]
-                c.SST.gf[:] = state[p.id][c.id]["gf"]
+                c.SST.gs.copy_(state[p.id][c.id]["gs"])
+                c.SST.gf.copy_(state[p.id][c.id]["gf"])
 
 
 def _zero_state(net):
     """Build an all-zero snapshot with the same structure as
-    _clone_state, so a 'fresh' reset zeroes rates, lrates, AND gavg --
+    _clone_state, so a 'fresh' reset zeroes rates, lrates, AND gs/gf --
     not just rates."""
     state = {}
     for p in net.populations.values():
@@ -101,7 +101,7 @@ class NetworkStepper:
         """
         reset_between : if True, the ENTIRE network's state (every
             population's rates, plus every compartment's lrates and
-            SST.gavg where present) is reset before every call to run()
+            SST.gs/gf where present) is reset before every call to run()
             -- i.e. before every image. If False, state carries over from
             one image to the next (whatever the network is left holding
             after the previous image's full warm-up/steps/cool-down
@@ -114,7 +114,7 @@ class NetworkStepper:
                 NetworkStepper construction time (i.e. however the
                 network came out of session/build_session loading),
                 reused for every single image.
-            'fresh': an all-zero state (rates, lrates, and gavg all
+            'fresh': an all-zero state (rates, lrates, and gs/gf all
                 zero), reused for every image.
             'preroll': run the network through `preroll_images` image
                 presentations first, with NO reset between them (same
@@ -194,7 +194,7 @@ class NetworkStepper:
         r0 = {}
         static = torch.zeros_like(img.flatten().to(self.device)).to(self.device)
         if (self.noise>0):
-            static[:] = (self.noise) * torch.randn_like(P.rates)*self.gain
+            static.copy_((self.noise) * torch.randn_like(P.rates)*self.gain)
         for cycle in range(n_cycles):
             P.rates.zero_()
             for _ in range(self.warm_up):
@@ -217,7 +217,6 @@ class NetworkStepper:
                         ravg = self.net.populations[pid].compartments["E_"+pid].rate_out.detach().cpu().clone()
                         tau = self.net.populations[pid].tau
                         r = (r-(1-tau)*r0[pid])#/tau
-                        #r = torch.pow(torch.abs(r),0.25)*torch.sign(r)
                         r = torch.sign(r)*(torch.abs(r)>1e-2)
                         buffers[pid].append(r)
             for t in range(self.cool_down):
@@ -232,7 +231,6 @@ class NetworkStepper:
                         ravg = self.net.populations[pid].compartments["E_"+pid].rate_out.detach().cpu().clone()
                         tau = self.net.populations[pid].tau
                         r = (r-(1-tau)*r0[pid])#/tau
-                        #r = torch.pow(torch.abs(r),0.25)*torch.sign(r)
                         r = torch.sign(r)*(torch.abs(r)>1e-2)
                         buffers[pid].append(r)
 
@@ -698,17 +696,17 @@ def main():
     parser.add_argument("--populations", nargs="+", default=["E"])
     parser.add_argument("--reset", action="store_true",
                         help="Reset the ENTIRE network's state (every population's rates, "
-                             "plus every compartment's lrates and SST.gavg where present) "
+                             "plus every compartment's lrates and SST.gs/gf where present) "
                              "before every image, not just the populations being probed. "
                              "Without this flag, state -- including running averages like "
-                             "lrates/gavg -- silently carries over from one image to the "
+                             "lrates/gs/gf -- silently carries over from one image to the "
                              "next across the whole calibration and test loop.")
     parser.add_argument("--reset-mode", choices=["loaded", "fresh", "preroll"], default="loaded",
                         help="Only used when --reset is given. 'loaded' (default): reset "
                              "every image to the full network state as it was when the "
                              "stepper was constructed (i.e. straight out of session "
                              "loading). 'fresh': reset every image to an all-zero state "
-                             "(rates, lrates, and gavg all zero). 'preroll': run the "
+                             "(rates, lrates, and gs/gf all zero). 'preroll': run the "
                              "network through --preroll-images image presentations first "
                              "with no reset between them (same dynamics as --reset NOT "
                              "being used), then fix whatever state that produces as the "

@@ -105,12 +105,26 @@ def log_compartment_stats(net):
         for cid, comp in pop.compartments.items():
             a    = comp.a.detach().cpu()
             w    = comp.w.detach().cpu()
-            wind = comp.w_ind_src.detach().cpu()
-            wq   = comp.wq.detach().cpu()
+            wql  = comp.wql.detach().cpu()
+            wqu  = comp.wqu.detach().cpu()
+
             G = float((comp.numerator / (comp.denominator + 1e-8)).mean())
             rat   = math.exp(float(comp.dM.detach().cpu().median()))
-            Neff  = float((1. / comp.k * comp.row_sum((w < wq.unsqueeze(1)).float())).mean())
             bfact = math.exp(float(comp.dN.detach().cpu().median()))
+
+            # lower tail fraction
+            Nlow = float(
+                (comp.row_sum((w < wql.unsqueeze(1)).float()) * (1.0/comp.k)).mean()
+            )
+
+            # upper tail fraction (diagnostic only)
+            Nhigh = float(
+                (comp.row_sum((w > wqu.unsqueeze(1)).float()) * (1.0/comp.k)).mean()
+            )
+
+            low_err = Nlow - comp.kappa
+            high_shape = float(comp.cv_high.detach().cpu().mean())
+
             mean_a = float(a.mean())
             std_a  = float(a.std(unbiased=False))
             m_w    = float(w.mean())
@@ -118,13 +132,15 @@ def log_compartment_stats(net):
 
             print(
                 f"{(comp.sourceid+'-'+comp.targetid):>8s} | "
-                f"A_m = {mean_a:8.3f} | "
-                f"A_cv = {std_a/(mean_a+1e-8):12.3e} | "
-                f"CV(w) = {std_w / (m_w + 1e-8):7.3f} | "
+                f"A={mean_a:7.3f} | "
+                f"A_cv={std_a/(mean_a+1e-8):8.2e} | "
                 f"an/ap = {rat:4.5f} | "
-                f"N = {Neff:7.5f} | "
-                f"b = {bfact:12.3e} | "
-                f"I-E = {G:7.5f}"
+                f"CVw={std_w/(m_w+1e-8):6.3f} | "
+                f"Low={Nlow:5.3f}({low_err:+6.3f}) | "
+                f"HighN={Nhigh:5.3f} | "
+                f"High={high_shape:+6.3f} | "
+                f"b={bfact:9.2e} | "
+                f"I-E={G:7.5f}"
             )
     print("--------------------------------\n")
 

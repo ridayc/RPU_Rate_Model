@@ -43,7 +43,8 @@ def EMA_CV(x,y):
 
 def weight_CV(x,y):
     x = x.reshape(*y.shape, -1)
-    return np.std(x)/np.mean(x)
+    print(x.shape)
+    return np.std(x,axis=1)/np.mean(x,axis=1)
 
 
 def quick_log(x,y):
@@ -136,11 +137,12 @@ rate_ctx = RateFileContext("rates/rates.h5")
 struct_ctx = StructureFileContext("structure/structure.h5")
 conn = NetworkConnectivity("connectivity/connectivity.h5")
 dv = DataView(rate_ctx=rate_ctx,struct_ctx=struct_ctx,connectivity=conn)
-#structure_heatmap(dv,pop_id="E",comp_id="E_E",field="a",field2="",t=slice(500,699),function=quick_log,fps=5)
-#structure_histogram(dv,pop_id="E",comp_id="E_E",field="a",field2="",t=slice(500,699),function=quick_log,fps=5,hist_type="kde")
-#structure_histogram(dv,pop_id="E",comp_id="E_E",field="w",field2="",function=quick_log,t=227,fps=5,hist_type="kde")
 nwritten = struct_ctx.n_written
 sl = slice(1,nwritten)
 print("Number of current steps: "+str(nwritten))
-time_series(dv,pop_id="E",comp_id="E_E",field="a",field2="",function=default,lfunc="gmean",t=sl)
+#time_series(dv,pop_id="E",comp_id="E_E",field="ravg",field2="",function=default,lfunc="gmean",t=sl)
+#time_series(dv,pop_id="E",comp_id="E_E",field="w",field2="a",function=weight_CV,lfunc="mean",t=sl)
+#structure_heatmap(dv,pop_id="E",comp_id="E_E",field="f",field2="",t=420,function=default,fps=5)
+structure_histogram(dv,pop_id="I",comp_id="I_I",field="w",field2="",t=18,function=quick_log,fps=5,hist_type="histogram")
+#structure_histogram(dv,pop_id="E",comp_id="E_E",field="w",field2="a",function=weight_CV,t=5,fps=5,hist_type="histogram")
 #structure_heatmap(dv,"E",t=slice(100,1000),fps=5)
