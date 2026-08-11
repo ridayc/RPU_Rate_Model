@@ -252,6 +252,7 @@ class Population:
                 buf["dM"].copy_(comp.dM, non_blocking=True)
                 buf["E_dw"].copy_(comp.E_dw, non_blocking=True)
                 buf["E2_dw"].copy_(comp.E2_dw, non_blocking=True)
+                buf["EN_dw"].copy_(comp.EN_dw, non_blocking=True)
                 buf["numerator"].copy_(comp.numerator, non_blocking=True)
                 buf["denominator"].copy_(comp.denominator, non_blocking=True)
                 buf["ravg"].copy_(comp.rate_average, non_blocking=True)
@@ -305,6 +306,7 @@ class Compartment:
         self.beta = compartment_param["beta"]
         # the minimal value that the beta parameter should be able to be multiplied. There is a minimal value, so that the relaxation term can not indefinitely drift towards zero
         self.beta0 = np.log(compartment_param["beta0"])
+        self.beta2 = np.log(compartment_param["beta2"])
         # decay and growth exponents resp. of the asymmetric ltp/ltd rule
         self.bn = compartment_param["bn"]
         self.bp = compartment_param["bp"]
@@ -478,13 +480,14 @@ class Compartment:
         self.cv_low = torch.zeros(self.target.nneu).to(self.net.device)
         self.cv_high = torch.zeros(self.target.nneu).to(self.net.device)
         self.synapse_scratch = torch.zeros((self.target.nneu, self.k)).to(self.net.device)
+        self.synapse_scratch2 = torch.zeros((self.target.nneu, self.k)).to(self.net.device)
         self.synapse_mask = torch.zeros((self.target.nneu, self.k),dtype=torch.bool).to(self.net.device)
         #self.w+= 1./self.k
         # random initialization of the synapse weights
         self.w.copy_(torch.exp(self.eps * torch.randn_like(self.w)))
         # adjusting the covariance learning rate so that the learning parameters are targeting relational changes in the synapse weights
         self.eta/=self.k
-        self.etar
+        self.etar/=self.k
         self.beta/=self.k
         # currently not in use
         #self.alpha/=self.k
@@ -545,6 +548,17 @@ class Compartment:
 
 
     def band_power(self):
+        # Band-power decomposition of compartment input:
+        #   r_τ = EMA_τ(I),                                # low-pass input at timescale τ
+        #   b_u = I − r_u
+        #   b_f = r_u − r_f
+        #   b_m = r_f − r_m
+        #   b_s = r_m − r_s
+        #   P_b = EMA_τp(b²) − EMA_τp(b)²                  # long-term band power
+        #
+        # I: weighted summed input (lrates) to the target compartment
+        # r_u/f/m/s: low-pass inputs at successive τ; b: band-pass component
+        # P_b: variance/power of each band
         amp =  self.rate_band["amplitude"]
         #rates = self.target.rates
         rates = self.target.compartments[amp["target"]].lrates
@@ -592,18 +606,19 @@ class Compartment:
         smoothing(self.CVs,self.CVs_fast,self.taus)
 
     def amplitude_power(self):
+        # Normalized band-power dead zone:
+        #   q_b = P_b / (P_f + P_m + P_s)
+        #
+        # Fast:  +η_f,low·max(θ_f,low − q_f, 0)
+        #        −η_f,high·max(q_f − θ_f,high, 0)
+        # Slow:  −η_s,low·max(θ_s,low − q_s, 0)
+        #        +η_s,high·max(q_s − θ_s,high, 0)
+        #
+        # P_b: band power; q_b: normalized band power
+        # θ: lower/upper dead-zone boundaries; η: correction strengths
         amp = self.rate_band["amplitude"]
         self.scratch.copy_(1./(amp["p"]["f"]+amp["p"]["m"]+amp["p"]["s"]+self.eps_a))
         Ptotinv = self.scratch
-
-        # band frequencies dead bands for fast and slow bands
-        #Regf1 = amp["p"]["f"]/(Ptot)<amp["theta"]["f"][0]
-        #Regf2 = amp["p"]["f"]/(Ptot)>amp["theta"]["f"][1]
-        #Regs1 = amp["p"]["s"]/(Ptot)<amp["theta"]["s"][0]
-        #Regs2 = amp["p"]["s"]/(Ptot)>amp["theta"]["s"][1]
-
-        #return Regf1*amp["eta"]["f"][0] - Regf2*amp["eta"]["f"][1] - Regs1*amp["eta"]["s"][0] + Regs2*amp["eta"]["s"][1]
-        # ramp to threshold approach for the band regions
         return torch.clamp(amp["theta"]["f"][0]-amp["p"]["f"]*(Ptotinv),min=0)*amp["eta"]["f"][0]-torch.clamp(amp["p"]["f"]*(Ptotinv)-amp["theta"]["f"][1],min=0)*amp["eta"]["f"][1]-torch.clamp(amp["theta"]["s"][0]-amp["p"]["s"]*(Ptotinv),min=0)*amp["eta"]["s"][0]+torch.clamp(amp["p"]["s"]*(Ptotinv)-amp["theta"]["s"][1],min=0)*amp["eta"]["s"][1]
 
 
@@ -689,6 +704,27 @@ class Compartment:
         # reset delta w to zero
 
         if(self.eta!=0):
+            # Per-iteration synaptic weight update:
+            #
+            #   learning rule
+            #       ↓
+            #   raw Δwᵢⱼ
+            #       ↓
+            #   weight-dependent LTP/LTD
+            #       ↓
+            #   mass-drift compensation via a₊/a₋
+            #       ↓
+            #   mass-conserving distribution regularization
+            #       ↓
+            #   L1 normalization
+            #       ↓
+            #   adaptive interpolation with previous weights
+            #       ↓
+            #   wᵢⱼ(t+1)
+            #
+            # The resulting weights remain L1-normalized per output neuron,
+            # while the regularizer controls the shape of the weight distribution
+            # and the adaptive interpolation controls the effective update timescale.
             # cov, hebbian and anti-hebbian like learning (a bit different for SST)
             if(self.SST is not None and self.SST.type!="pre"):
                 self.SST.synapse()
@@ -697,95 +733,20 @@ class Compartment:
             else:
                 self.cross_rule(self.target.rates,self.source.rates,self.rate_out,self.rate_in,self.rate_out2,self.rate_in2)
 
-            # ltp and ltd adapation for large synapses
-            #self.dw.copy_(((self.a/self.A0)**(self.Jn-1)).unsqueeze(1)*torch.clamp(self.dw,max=0)*(torch.pow((1+self.k*self.w)*0.5,self.bn))+((self.a/self.A0)**(self.Jp-1)).unsqueeze(1)*torch.clamp(self.dw,min=0)*(torch.pow((1+self.k*self.w)*0.5,-self.bp)))
 
-            
-            self.synapse_scratch.copy_(self.w).mul_(self.k*0.5).add_(0.5)
-            self.dw.copy_(torch.clamp(self.dw,max=0)*(torch.pow(self.synapse_scratch,self.bn))+torch.clamp(self.dw,min=0)*(torch.pow(self.synapse_scratch,-self.bp)))
+            #self.ltp_weight_adaption()
             self.dw.add_(self.w)
             # clamp at zero for normalization and total mass drift estimate
-            self.dw.clamp_(min=self.eps_w)
+            self.dw.clamp_(min=0)
 
-            #'''
-            # prepare for an/ap adaptation to cancel of L1 mass drift effects
-            if(self.etal>0 or self.etar>0):
-                # estimate of long term total interal weight change average
-                self.synapse_scratch.copy_(self.dw-self.w)
-                smoothing(self.E2_dw,torch.sum(torch.abs(self.synapse_scratch),dim=1),self.taul)
+            self.synaptic_drift()
 
-            if(self.etal>0):
-                # push an/ap ratio towards balanced ltp/ltd averages over all learning
-                # estimate of long term average weight drift
-                smoothing(self.E_dw,torch.sum(self.synapse_scratch,dim=1),self.taul)
-                self.dM.add_((self.etal*self.E_dw/(self.E2_dw+self.eps_a)).double())
-                #tM = torch.abs(self.dM.float())
-                #self.ci = torch.exp(self.dM.float())
-                self.ap.copy_(torch.exp(-self.dM.float()*0.5))
-                self.an.copy_(torch.exp(self.dM.float()*0.5))
-            #'''
+            self.weight_regularizer()
 
-            # L2 regularizer + synapse turnover (because of L1 normalization of weights the form below should have a net zero weight change)
-            # that means we use this as a ltp/ltd independent weight distribution regularizer
-            if(self.beta>0):
-                #self.dw.add_((1/self.k*torch.sum(self.dw,dim=1).unsqueeze(1)-self.dw)*((self.beta*torch.exp(self.dN)*self.E2_dw).clamp_(max=1)).unsqueeze(1))
-                self.synapse_scratch.copy_((1/self.k*torch.sum(self.dw,dim=1)).unsqueeze(1))
-                # synapse_scratch = mean.unsqueeze(1) - dw, built in place: no (nneu,k) alloc
-                self.synapse_scratch.sub_(self.dw)
-                self.scratch.copy_((self.beta * torch.exp(self.dN.float()) * self.E2_dw).clamp_(max=1))
-                # scale broadcast in place, then accumulate into dw
-                self.synapse_scratch.mul_(self.scratch.unsqueeze(1))
-                self.dw.add_(self.synapse_scratch)
+            self.weight_merge()
 
-                
-
-            # back to smoothing and renomalization
-            # two very important options here. Either we normalize and treat weight updates as a capped change of the current weights
-            # Or we don't normalize and let large weight changes take full effect before normalization potentially overwriting the old weights if the rates are much higher than base line.
-            # Somehow the normalized case seems to yield more realistic results. Needs more checking.
-            # Currently the new weights are normalized, and the concentration of the deviations of the new weights from the old ones determines if smoothed needs to be penalized to make single weight excursions weaker.
-            self.normalize_by_row(self.dw)
-            self.synapse_scratch.copy_(self.dw).sub_(self.w)
-            self.synapse_scratch.mul_(self.synapse_scratch)
-            self.scratch.copy_(self.synapse_scratch.sum(dim=1))
-            self.scratch.mul_(self.k/self.ck/self.ck).add_(1).reciprocal_().mul_(self.tauw)
-            self.synapse_scratch.copy_(self.w)
-            self.w.lerp_(self.dw, self.scratch.unsqueeze(1))
-            self.w.clamp_(min=self.eps_w)
-            self.normalize_weights()
-            self.synapse_scratch.sub_(self.w).abs_()
-            smoothing(self.EN_dw,0.5*torch.sum(self.synapse_scratch,dim=1),self.taul)
-            #self.EN_dw.copy_(0.5*torch.sum(self.synapse_scratch,dim=1))
+            self.adapt_regularizer()
             
-            # old idea was based on using synapse sparsity as a comparison measure. We are more explicit here. We say regularization and learning should balance each other out on short timescales (even though the net effect of the regularizer on dw is zero, the important part is the effect it has on weights at the boundary to zero!)
-
-            # different approach. Since we assume log normal, we can estimate a lognormal wauntile from CV and use that as a live threshold. 
-            #loc = "pre cv"
-            #self.check_block(loc)
-            
-            if(self.etar>0):
-                # calculate cv^2+1
-                torch.mul(self.w, self.w, out=self.synapse_scratch)
-                self.cv.copy_(torch.clamp(torch.sum(self.synapse_scratch,dim=1)*self.k,min=1.0+self.eps_a))
-                kinv = 1./self.k
-                self.scratch.copy_(torch.sqrt(torch.log(self.cv)))
-                # threshold weight for the kappa quantile (based on a parametrized estimation of the log normal weight given the measured cv weight)
-                self.wql.copy_(kinv/torch.sqrt(self.cv)*torch.exp(self.scratch*self.zql))
-                # upper quantile threshold (reuse the same z value)
-                self.wqu.copy_(kinv/torch.sqrt(self.cv) * torch.exp(self.scratch*self.zqu))
-                # compare expected tail fraction to measured tail fraction.
-                torch.lt(self.w, self.wql.unsqueeze(1), out=self.synapse_mask)
-                self.cv_low.copy_(torch.sum(self.synapse_mask,dim=1,dtype=torch.float32)*kinv - (self.kappa + self.rq))
-                # expected log normal mass
-                self.cv_high.copy_(0.5*torch.erfc((self.zqu - self.scratch)/np.sqrt(2.0)))
-                # upper tail mask stored in synapse-sized buffer
-                torch.gt(self.w, self.wqu.unsqueeze(1), out=self.synapse_mask)
-                self.synapse_scratch.copy_(self.synapse_mask)
-                self.synapse_scratch.mul_(self.w)
-                # M_obs*kappa2 - M_LN*C_obs
-                self.cv_high.copy_(torch.sum(self.synapse_scratch,dim=1)*self.kappa2- (self.rin+1)*self.cv_high*torch.sum(self.synapse_mask,dim=1,dtype=torch.float32)*kinv)
-                self.dN.add_((((self.cv<(self.thetar*self.thetar+1)).float()*-2.+torch.logical_or(self.cv_low>0,self.cv_high>0).float()-torch.logical_and(self.cv_low<0,self.cv_high<0).float())*self.EN_dw*self.etar).double())
-                self.dN.clamp_(min=self.beta0)
 
         # adjust compartment amplitudes
         # either balance inhbition and excitation gains or balance band power fractions
@@ -808,10 +769,22 @@ class Compartment:
             # SST neurons have some experimental slow homeostasis options. Either log-normal based distribution shaping of the target populatoin, or a PAC based theta vs gamma controller. It currently seems like standard ratio targeting of balancing the PV and SST pathways is more stable, but these options are left here in cases some one comes up with an alternative or preferable stabilization approach.Using the SST options loses control of "handtuned" SST vs PV balance, but leads to more log normal like distributions of E and/or PV population firing.
             # amplitude learning based on I-E ratios or similar
             elif(self.ratio=="EPV"):
+                # E→PV homeostasis: jointly regulate input current and output rate:
+                #   Δlog aᵢ = ζ·log[(z·I_E/aᵢ)·(r_target/r̄ᵢ)]
+                #
+                # I_E: EMA of E input current; r̄ᵢ: output-rate EMA
+                # z: target I_E/aᵢ ratio; r_target: target output rate
+                # ζ: adaptation rate
                 smoothing(self.numerator,self.lrates,self.taug)
                 self.denominator.copy_((self.a+self.eps_a)/self.z_value)
                 #self.loga+=(self.zeta*torch.log((self.numerator)*torch.sqrt(self.rate_target/(self.rate_average+self.eps_a)))).double()
                 self.loga.add_((self.zeta*torch.log((self.numerator+self.eps_a)/self.denominator*self.rate_target/(self.rate_average+self.eps_a))).double())
+            # Hybrid PV→E homeostasis: regulate output rate and E/(E−I) input balance:
+            #   Δlog aᵢ = ζ·[log(r̄ᵢ/r_target) + θ_z·(E/(E−I) − z)]
+            #
+            # E: EMA of excitatory input; I: EMA of inhibitory input to the same target neuron
+            # z: target E/(E−I) ratio; θ_z: balance-feedback strength
+            # r̄ᵢ: target output-rate EMA; r_target: target rate; ζ: adaptation rate
             elif(self.ratio=="E2"):
                 E = self.target.compartments[self.c_c[0]]
                 I = self.target.compartments[self.c_c[1]]
@@ -830,6 +803,12 @@ class Compartment:
                 self.loga.add_((self.zeta*(torch.log((self.rate_average+self.eps_a)/self.rate_target)+(self.numerator/(self.denominator+self.eps_a)-self.z_value)*self.thetaz)).double())
                 #'''
             elif(self.ratio=="gain"):
+                # Homeostatic amplitude adaptation to a target input-current ratio:
+                #   Δlog aᵢ = ζ·log(z·I_PV / I_E)
+                #
+                # I_E, I_PV: EMA(|input current|) to the same target neuron
+                # z: target I_E/I_PV ratio; ζ: adaptation rate
+                # c_c[0] and c_c[1] must target the same neuron: the comparison is local.
                 self.scratch.copy_((self.a+self.eps_a)/self.z_value)
                 smoothing(self.numerator,torch.abs(self.target.compartments[self.c_c[0]].lrates),self.taug)
                 smoothing(self.denominator,torch.abs(self.target.compartments[self.c_c[1]].lrates),self.taug)
@@ -839,16 +818,212 @@ class Compartment:
             # amplitude learning based on I-E ratios or similar
         # slow drift towards a target amplitude value
         if(self.rho>0):
+            # Homeostatic amplitude relaxation toward target A₀:
+            #   Δlog aᵢ = ρ·(log|A₀| − log aᵢ)
+            #
+            # A₀: target neuron-wide amplitude; ρ: adaptation rate
             self.loga.add_((self.rho*(self.lA0-self.loga)).double())
         elif(self.rho<0):
+            # Homeostatic amplitude adaptation relative to the geometric mean input rate:
+            #   Δlog aᵢ = sgn(A₀)·ρ·log(r̄ᵢ / (|A₀|·GMⱼ[r̄ⱼ]))
+            #
+            # A₀: signed target ratio of output rate to geometric-mean input rate
+            # ρ: adaptation rate; r̄ᵢ: output-rate EMA; GMⱼ: geometric mean over inputs
             torch.take(torch.log(self.rate_average+self.eps_a),self.w_ind_src,out=self.synapse_scratch)
             self.loga.add_((np.sign(self.A0)*self.rho*(torch.log((self.rate_average+self.eps_a)/(torch.exp(1/self.k*torch.sum(self.synapse_scratch,dim=1))+self.eps_a))-self.lA0)).double())
         # average rate target based amplitude learning. Maybe numerical offset values should be parametrized at some point
+        # Homeostatic neuron-wide amplitude:
+        #   aᵢ ← aᵢ · (r_target / r̄ᵢ)^δ
+        #
+        # aᵢ: overall synaptic amplitude of neuron i
+        # r̄ᵢ: EMA of its output rate; r_target: desired rate
+        # δ: homeostatic adaptation rate
         if(self.delta!=0):
             self.loga.add_((self.delta*torch.log((self.rate_target)/(self.rate_average+self.eps_a))).double())
         self.a.copy_(torch.exp(self.loga.float()))
 
+    def ltp_weight_adaption(self):
+        # ltp and ltd adapation for large synapses
+        #self.dw.copy_(((self.a/self.A0)**(self.Jn-1)).unsqueeze(1)*torch.clamp(self.dw,max=0)*(torch.pow((1+self.k*self.w)*0.5,self.bn))+((self.a/self.A0)**(self.Jp-1)).unsqueeze(1)*torch.clamp(self.dw,min=0)*(torch.pow((1+self.k*self.w)*0.5,-self.bp)))
+
+        # w'ᵢⱼ = wᵢⱼ + Δwᵢⱼ ·
+        #        { [(1 + k wᵢⱼ)/2]ᵇⁿ,   Δwᵢⱼ < 0  (LTD)
+        #        { [(1 + k wᵢⱼ)/2]⁻ᵇᵖ,  Δwᵢⱼ > 0  (LTP)
+        #
+        # where:
+        #   wᵢⱼ     = synaptic weight at the previous timestep
+        #   Δwᵢⱼ    = raw weight change from the learning rule
+        #   w'ᵢⱼ    = temporary updated weight
+        #   k       = number of synapses per output neuron; mean weight = 1/k
+        #   bₙ      = LTD-specific modification of weight dependence
+        #   bₚ      = LTP-specific modification of weight dependence
+        #   ε_w     = minimum weight for normalization / mass-drift estimation
+        self.synapse_scratch.copy_(self.w).mul_(self.k*0.5).add_(0.5)
+        self.dw.copy_(torch.clamp(self.dw,max=0)*(torch.pow(self.synapse_scratch,self.bn))+torch.clamp(self.dw,min=0)*(torch.pow(self.synapse_scratch,-self.bp)))
+        self.dw.add_(self.w)
+        # clamp at zero for normalization and total mass drift estimate
+        self.dw.clamp_(min=0)
+
+    def synaptic_drift(self):
+        # Estimate normalized signed long-term L1 normalized mass drift per output neuron:
+            #   Dᵢ = EMA[Σⱼ Δwᵢⱼ] / (EMA[Σⱼ |Δwᵢⱼ|] + εₐ)
+            #
+            # Adapt the LTP/LTD balance to cancel persistent drift:
+            #   Mᵢ ← Mᵢ + ηₗ Dᵢ
+            #   a₊ᵢ = exp(−Mᵢ/2)
+            #   a₋ᵢ = exp(+Mᵢ/2)
+            #   a₊ᵢ a₋ᵢ = 1
+            #
+            # where:
+            #   Δwᵢⱼ = w'ᵢⱼ − wᵢⱼ,  actual synaptic weight change
+            #   Mᵢ    = accumulated mass-drift correction for output neuron i
+            #   ηₗ    = mass-drift adaptation rate
+            #   a₊ᵢ   = LTP coefficient,  a₋ᵢ = LTD coefficient
+            #   εₐ    = numerical-stability constant
+            #   EMA   = exponential moving average with time constant τₗ
+            #
+            # For uncorrelated xⱼ and yᵢ, the synapse rules naturally give a₊ = a₋ = 1.
+
+            if(self.etal>0):
+                self.synapse_scratch.copy_(self.dw-self.w)
+                smoothing(self.E2_dw,torch.sum(torch.abs(self.synapse_scratch),dim=1),self.taul)
+                # push an/ap ratio towards balanced ltp/ltd averages over all learning
+                # estimate of long term average weight drift
+                smoothing(self.E_dw,torch.sum(self.synapse_scratch,dim=1),self.taul)
+                self.dM.add_((self.etal*self.E_dw/(self.E2_dw+self.eps_a)).double())
+                #tM = torch.abs(self.dM.float())
+                #self.ci = torch.exp(self.dM.float())
+                self.ap.copy_(torch.exp(-self.dM.float()*0.5))
+                self.an.copy_(torch.exp(self.dM.float()*0.5))
         
+    def weight_regularizer(self):
+        # L2 regularizer + synapse turnover (because of L1 normalization of weights the form below should have a net zero weight change)
+        # that means we use this as a ltp/ltd independent weight distribution regularizer
+        # L2-like weight regularization with mass-conserving synapse turnover:
+        #   Δwᵢⱼ ← Δwᵢⱼ + λᵢ · (⟨Δwᵢ⟩ − Δwᵢⱼ)
+        #   λᵢ = min(β · exp(dNᵢ) · E₂ᵢ, 1)
+        #
+        # where:
+        #   Δwᵢⱼ    = current weight change for synapse j → i
+        #   ⟨Δwᵢ⟩   = (1/k) Σⱼ Δwᵢⱼ, mean weight change of output neuron i
+        #   β        = regularization / turnover strength
+        #   dNᵢ     = accumulated regularization adaptation
+        #   E₂ᵢ     = long-term EMA of total |Δwᵢⱼ|
+        #   λᵢ      = adaptive regularization strength, capped at 1
+        #
+        # Σⱼ(⟨Δwᵢ⟩ − Δwᵢⱼ) = 0, so the regularizer produces zero net weight change.
+        if(self.beta>0):
+            #self.dw.add_((1/self.k*torch.sum(self.dw,dim=1).unsqueeze(1)-self.dw)*((self.beta*torch.exp(self.dN)*self.E2_dw).clamp_(max=1)).unsqueeze(1))
+            self.synapse_scratch.copy_((1/self.k*torch.sum(self.dw,dim=1)).unsqueeze(1))
+            # synapse_scratch = mean.unsqueeze(1) - dw, built in place: no (nneu,k) alloc
+            self.synapse_scratch.sub_(self.dw)
+            self.scratch.copy_((self.beta * torch.exp(self.dN.float()) * self.EN_dw).clamp_(max=1))
+            # scale broadcast in place, then accumulate into dw
+            self.synapse_scratch.mul_(self.scratch.unsqueeze(1))
+            self.dw.add_(self.synapse_scratch)
+
+    def weight_merge(self):
+        # back to smoothing and renomalization
+        # two very important options here. Either we normalize and treat weight updates as a capped change of the current weights
+        # Or we don't normalize and let large weight changes take full effect before normalization potentially overwriting the old weights if the rates are much higher than base line.
+        # Somehow the normalized case seems to yield more realistic results. Needs more checking.
+        # Currently the new weights are normalized, and the concentration of the deviations of the new weights from the old ones determines if smoothed needs to be penalized to make single weight excursions weaker.
+        # Adaptively merge the proposed weights with the current weights:
+        #   dᵢ = Σⱼ (w̃ᵢⱼ − wᵢⱼ)²
+        #   αᵢ = τw / (1 + k dᵢ / ck²)
+        #   wᵢ ← (1 − αᵢ) wᵢ + αᵢ w̃ᵢ
+        #
+        # where:
+        #   wᵢ     = current L1-normalized weights of output neuron i
+        #   w̃ᵢ    = proposed L1-normalized weights
+        #   dᵢ     = squared Euclidean distance between current and proposed weights
+        #   αᵢ     = adaptive fraction of the proposed update applied
+        #   τw     = base weight-update rate
+        #   k      = number of synapses per output neuron
+        #   ck      = characteristic relative weight change for halving αᵢ
+        #            (defined relative to the mean weight 1/k)
+        #   εw     = minimum allowed weight
+        #
+        # ck is chosen such that a characteristic change of the mean weight
+        # 1/k by a factor ck reduces the proposed update rate by 1/2.
+        self.normalize_by_row(self.dw)
+        self.synapse_scratch.copy_(self.dw).sub_(self.w)
+        self.synapse_scratch.mul_(self.synapse_scratch)
+        self.scratch.copy_(self.synapse_scratch.sum(dim=1))
+        self.scratch.mul_(self.k/self.ck/self.ck).add_(1).reciprocal_().mul_(self.tauw)
+        self.synapse_scratch.copy_(self.w)
+        self.w.lerp_(self.dw, self.scratch.unsqueeze(1))
+        self.w.clamp_(min=self.eps_w)
+        self.normalize_weights()
+
+    def adapt_regularizer(self):
+        # old idea was based on using synapse sparsity as a comparison measure. We are more explicit here. We say regularization and learning should balance each other out on short timescales (even though the net effect of the regularizer on dw is zero, the important part is the effect it has on weights at the boundary to zero!)
+
+        # different approach. Since we assume log normal, we can estimate a lognormal wauntile from CV and use that as a live threshold. 
+        #loc = "pre cv"
+        #self.check_block(loc)
+        # Adapt regularization to maintain a controlled synaptic weight distribution.
+        #
+        # Approximate the L1-normalized weight distribution as log-normal:
+        #   cvᵢ = k Σⱼ wᵢⱼ² = 1 + CVᵢ²
+        #   σᵢ  = √log(cvᵢ)
+        #   w_qᵢ = (1 / (k√cvᵢ)) · exp(σᵢ z_q)
+        #
+        # where:
+        #   wᵢⱼ       = L1-normalized synaptic weight
+        #   k          = number of synapses per output neuron
+        #   cvᵢ        = 1 + squared coefficient of variation of wᵢ
+        #   σᵢ         = log-normal standard deviation
+        #   w_qᵢ       = weight threshold at standard-normal quantile z_q
+        #
+        # Compare the observed tails with the log-normal prediction:
+        #   lowᵢ  = P_obs(w < w_q_low) − (κ + r_q)
+        #
+        #   highᵢ = κ₂ · Σ_{w>w_q_high} w
+        #           − (r_in + 1) · P_LN(w>w_q_high) · P_obs(w>w_q_high)
+        #
+        # where:
+        #   κ        = target fraction of low-weight synapses
+        #   r_q      = tolerance for the lower-tail fraction comparison
+        #   κ₂       = scaling factor matching observed and expected upper-tail mass
+        #   r_in     = relative tolerance for the expected upper-tail mass per neuron
+        #   P_obs    = observed fraction of synapses in the corresponding tail
+        #   P_LN     = expected log-normal tail fraction
+        #
+        # Adapt the regularization strength:
+        #   dNᵢ ← dNᵢ + ηᵣ E₂ᵢ · Sᵢ
+        #   dNᵢ ← max(dNᵢ, β₀)
+        #
+        # Sᵢ increases regularization when the weight distribution has excessive
+        # spread or either tail exceeds its target/tolerance.
+        #
+        # dNᵢ = accumulated regularizer adaptation for output neuron i
+        # E₂ᵢ = long-term total absolute weight-change rate
+        # ηᵣ  = regularizer adaptation rate
+        # β₀  = lower bound on dNᵢ
+        if(self.etar>0):
+            # calculate cv^2+1
+            torch.mul(self.w, self.w, out=self.synapse_scratch)
+            self.cv.copy_(torch.clamp(torch.sum(self.synapse_scratch,dim=1)*self.k,min=1.0+self.eps_a))
+            kinv = 1./self.k
+            self.scratch.copy_(torch.sqrt(torch.log(self.cv)))
+            # threshold weight for the kappa quantile (based on a parametrized estimation of the log normal weight given the measured cv weight)
+            self.wql.copy_(kinv/torch.sqrt(self.cv)*torch.exp(self.scratch*self.zql))
+            # upper quantile threshold (reuse the same z value)
+            self.wqu.copy_(kinv/torch.sqrt(self.cv) * torch.exp(self.scratch*self.zqu))
+            # compare expected tail fraction to measured tail fraction.
+            torch.lt(self.w, self.wql.unsqueeze(1), out=self.synapse_mask)
+            self.cv_low.copy_(torch.sum(self.synapse_mask,dim=1,dtype=torch.float32)*kinv - (self.kappa + self.rq))
+            # expected log normal mass
+            self.cv_high.copy_(0.5*torch.erfc((self.zqu - self.scratch)/np.sqrt(2.0)))
+            # upper tail mask stored in synapse-sized buffer
+            torch.gt(self.w, self.wqu.unsqueeze(1), out=self.synapse_mask)
+            self.synapse_scratch.copy_(self.synapse_mask)
+            self.synapse_scratch.mul_(self.w)
+            # M_obs*kappa2 - M_LN*C_obs
+            self.cv_high.copy_(torch.sum(self.synapse_scratch,dim=1)*self.kappa2- (self.rin+1)*self.cv_high*torch.sum(self.synapse_mask,dim=1,dtype=torch.float32)*kinv)
+            self.dN.add_((((self.cv<(self.thetar*self.thetar+1)).float()*-2.+torch.logical_or(self.cv_low>0,self.cv_high>0).float()-torch.logical_and(self.cv_low<0,self.cv_high<0).float())*self.EN_dw*self.etar).double())
+            self.dN.clamp_(min=self.beta0,max=self.beta2)
 
     # full object save can't handle cuda stream objects so we work around that with a save and load state that removes the stream of this class
     def __getstate__(self):
@@ -911,27 +1086,46 @@ class Compartment:
         return torch.sum(self.dw, dim=1)
 
     def cross_rule(self,yi,xj,yavg,xavg,yavg2=0,xavg2=0):
+        if(self.eta>0):
+            ap = self.ap
+            an = self.an
+            bp = -self.bp
+            bn = self.bn
+        else:
+            ap = self.an
+            an = self.ap
+            bn = -self.bp
+            bp = self.bn
         # assumes dw and synapse_scratch are not in use already!
         # bcm-like learning rule
         if(self.rout>0):
-            #return (self.ap*yi*yi).unsqueeze(1)*(xj**self.rout)[self.w_ind_src]-(self.an*yi*yavg2/(yavg+self.eps_a)).unsqueeze(1)*(xj**self.rout)[self.w_ind_src]
-            if(self.eta>0):
-                ap = self.ap
-                an = self.an
-            else:
-                ap = self.an
-                an = self.ap
+        # Δwᵢⱼ = η yᵢ (a₊ yᵢ − a₋ ȳ²ᵢ/(ȳᵢ+εₐ)) xⱼʳᵒᵘᵗ
+        # where:
+        #   yᵢ   = output activity,  xⱼ = input activity
+        #   ȳᵢ   = EMA[yᵢ],          ȳ²ᵢ = EMA[yᵢ²]
+        #   a₊/a₋ = potentiation/depression coefficients (swapped when η ≤ 0)
+        #   r_out = input exponent,   εₐ = numerical-stability constant
+            #self.dw.copy_((self.eta*yi*(ap*yi-an*yavg2/(yavg+self.eps_a))).unsqueeze(1)).mul_(self.synapse_scratch)
             torch.take(xj**self.rout, self.w_ind_src, out=self.synapse_scratch)
-            self.dw.copy_((self.eta*yi*(ap*yi-an*yavg2/(yavg+self.eps_a))).unsqueeze(1)).mul_(self.synapse_scratch)
+            self.dw.copy_((self.eta*ap*yi*yi).unsqueeze(1)).mul_(self.synapse_scratch)
+            self.synapse_scratch2.copy_(self.w).mul_(self.k*0.5).add_(0.5).pow_(bp)
+            self.dw.mul_(self.synapse_scratch2)
+            self.synapse_scratch2.copy_(self.w).mul_(self.k*0.5).add_(0.5).pow_(bn).mul_((self.eta*an*yi*yavg2/(yavg+self.eps_a)).unsqueeze(1)).mul_(self.synapse_scratch)
+            self.get_ltp_shift_()
+            self.dw.sub_(self.synapse_scratch2)
+
+
+
         # Vogels like learning rule
         elif(self.rout==0):
+            # Δwᵢⱼ = η · (a₊ yᵢ² − a₋ · ȳ²ᵢ) · xⱼ
+            # where:
+            #   yᵢ     = output activity,  xⱼ = input activity
+            #   ȳ²ᵢ    = EMA of yᵢ²
+            #   a₊/a₋  = potentiation/depression coefficients (swapped when η ≤ 0)
+            #   η      = learning-rate / update-sign parameter
+            # old/alternative version
             # return (self.ap*yi).unsqueeze(1)*xj[self.w_ind_src]-(self.an*yavg*self.k/(torch.sum(xavg[self.w_ind_src],dim=1)+self.eps_a)).unsqueeze(1)*(xj*xavg)[self.w_ind_src]
-            if(self.eta>0):
-                ap = self.ap
-                an = self.an
-            else:
-                ap = self.an
-                an = self.ap
             '''    
             torch.take(xj, self.w_ind_src, out=self.dw)
             self.dw.mul_((self.eta*ap*yi*yi).unsqueeze(1))
@@ -944,22 +1138,49 @@ class Compartment:
             self.synapse_scratch.mul_(self.scratch.unsqueeze(1))
             self.dw.sub_(self.synapse_scratch)
             #'''
+            #torch.take(xj, self.w_ind_src, out=self.synapse_scratch)
+            #self.dw.copy_((self.eta*(ap*yi*yi-an*yavg2)).unsqueeze(1)).mul_(self.synapse_scratch)
+
             torch.take(xj, self.w_ind_src, out=self.synapse_scratch)
-            self.dw.copy_((self.eta*(ap*yi*yi-an*yavg2)).unsqueeze(1)).mul_(self.synapse_scratch)
+            self.dw.copy_((self.eta*ap*yi*yi).unsqueeze(1)).mul_(self.synapse_scratch)
+            self.synapse_scratch2.copy_(self.w).mul_(self.k*0.5).add_(0.5).pow_(bp)
+            self.dw.mul_(self.synapse_scratch2)
+            self.synapse_scratch2.copy_(self.w).mul_(self.k*0.5).add_(0.5).pow_(bn).mul_((self.eta*an*yavg2).unsqueeze(1)).mul_(self.synapse_scratch)
+            self.get_ltp_shift_()
+            self.dw.sub_(self.synapse_scratch2)
         # covariance hebb like rule
         else:
+            # Δwᵢⱼ = η · [a₊ (yᵢ xⱼ)ʳ − a₋ ȳᵣᵢ x̄ᵣⱼ]
+            # where:
+            #   yᵢ     = output activity,       xⱼ = input activity
+            #   r      = |r_out|
+            #   ȳᵣᵢ    = EMA[yᵢʳ]
+            #   x̄ᵣⱼ    = EMA[xⱼʳ]
+            #   a₊/a₋  = potentiation/depression coefficients (swapped when η ≤ 0)
+            #   η      = learning-rate / update-sign parameter
             # return (self.ap*yi**np.abs(self.rout)).unsqueeze(1)*(xj**np.abs(self.rout))[self.w_ind_src]-(self.an*yavg2).unsqueeze(1)*xavg2[self.w_ind_src]
-            if(self.eta>0):
-                ap = self.ap
-                an = self.an
-            else:
-                ap = self.an
-                an = self.ap
+            '''
             torch.take(xj**np.abs(self.rout), self.w_ind_src, out=self.dw)
             self.dw.mul_((self.eta*ap*yi**np.abs(self.rout)).unsqueeze(1))
             torch.take(xavg2, self.w_ind_src, out=self.synapse_scratch)
             self.synapse_scratch.mul_((self.eta*an*yavg2).unsqueeze(1))
             self.dw.sub_(self.synapse_scratch)
+            '''
+            torch.take(xj**np.abs(self.rout), self.w_ind_src, out=self.dw)
+            self.dw.mul_((self.eta*ap*yi**np.abs(self.rout)).unsqueeze(1))
+            self.synapse_scratch2.copy_(self.w).mul_(self.k*0.5).add_(0.5).pow_(bp)
+            self.dw.mul_(self.synapse_scratch2)
+            torch.take(xavg2, self.w_ind_src, out=self.synapse_scratch)
+            self.synapse_scratch2.copy_(self.w).mul_(self.k*0.5).add_(0.5).pow_(bn).mul_((self.eta*an*yavg2).unsqueeze(1)).mul_(self.synapse_scratch)
+            self.get_ltp_shift_()
+            self.dw.sub_(self.synapse_scratch2)
+
+    def get_ltp_shift_(self):
+        if(self.etar>0 or self.beta>0):
+            self.scratch.copy_(torch.sum(torch.abs(self.dw),dim=1)).add_(torch.sum(torch.abs(self.synapse_scratch2),dim=1))
+            smoothing(self.EN_dw,self.scratch,self.taul)
+            
+            
 
     def check(self,loc,name, x):
         bad = ~torch.isfinite(x)
@@ -1044,11 +1265,30 @@ class SST:
         if(self.type=="pre"):
             return self.comp.type*self.comp.a*(self.comp.weight_multiply(self.comp.source.rates**self.omega))**(1/self.omega)
         elif(self.type=="post"):
+            # Reduced short-term synaptic facilitation:
+            #   g = EMA_τ(r_pre)
+            #
+            # r_pre: presynaptic firing rate
+            # g: facilitated presynaptic signal; τ: facilitation timescale
+            #
+            # I_syn = type·a·W(g)
             smoothing(self.gs,self.comp.source.rates,self.tau[0])
             self.g.copy_(self.gs)
             return self.comp.type*self.comp.a*(self.comp.weight_multiply(self.gs))
         # using the SST type as a model for synaptic depression
         else:
+            # Reduced short-term synaptic depression:
+            #   g_f = EMA_{τ₀}(r_pre)
+            #   g   = [r_pre − τ₁·g_f]_+
+            #   g_s = EMA_{τ₂}(g)
+            #   g   = [g − τ₃·g_s]_+
+            #   I_syn = type·a·W(g)
+            #
+            # r_pre: presynaptic firing rate
+            # g_f, g_s: fast/slow activity traces
+            # g: depressed presynaptic signal
+            # τ₁, τ₃: depression strengths; τ₀, τ₂: trace timescales
+            # a: synapse-type/neuron-wide amplitude; W(g): weighted synaptic input
             smoothing(self.gf,self.comp.source.rates,self.tau[0])
             self.g.copy_(torch.clamp(self.comp.source.rates-self.tau[1]*self.gf,min=0))
             smoothing(self.gs,self.g,self.tau[2])
@@ -1122,7 +1362,7 @@ rin,rout: firing rates flipping Hebbian learning for (mainly inhibitory) synapse
 delta: amplitude learning rate
 rate_target: target long term firing average for the post synaptic neuron
 '''
-def compartment_parameters(id,source,target,ellipse=[1,1],tsyn=1,A=2,A0=-1,eta=0,etal=0,etar=0,alpha=0,nu=0,beta=0,beta0=1e-4,kappa=0,kappa2="",an=1,ap=1,Jn=0.5,Jp=0.5,bn=0,bp=0,c_c=None,zeta=0,zeta2="",z_value=0,thetaz=0,ratio="E/I",bands=None,rho=0,tau=0,taug=0,tauw=0,ck=1,taul=0,taur=0,thetar=0,rin=1,rout=1,tauin=1,tauout=1,tauout2="",rq=0,rt=1,noise=0,cv=0,delta=0,rate_target=1,eps=1,stype="",stat=False,power=None,freq=None,SST=None):
+def compartment_parameters(id,source,target,ellipse=[1,1],tsyn=1,A=2,A0=-1,eta=0,etal=0,etar=0,alpha=0,nu=0,beta=0,beta0=1e-4,beta2=1e4,kappa=0,kappa2="",an=1,ap=1,Jn=0.5,Jp=0.5,bn=0,bp=0,c_c=None,zeta=0,zeta2="",z_value=0,thetaz=0,ratio="E/I",bands=None,rho=0,tau=0,taug=0,tauw=0,ck=1,taul=0,taur=0,thetar=0,rin=1,rout=1,tauin=1,tauout=1,tauout2="",rq=0,rt=1,noise=0,cv=0,delta=0,rate_target=1,eps=1,stype="",stat=False,power=None,freq=None,SST=None):
     parameters = {}
     parameters["id"] = id
     parameters["source"] = source
@@ -1148,6 +1388,7 @@ def compartment_parameters(id,source,target,ellipse=[1,1],tsyn=1,A=2,A0=-1,eta=0
     parameters["nu"] = nu
     parameters["beta"] = beta
     parameters["beta0"] = beta0
+    parameters["beta2"] = beta2
     parameters["thetar"] = thetar
     parameters["an"] = an
     parameters["ap"] = ap
