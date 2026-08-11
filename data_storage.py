@@ -31,6 +31,7 @@ def initialize_cpu_buffers(network):
                 "dM": torch.empty(comp.target.nneu, dtype=torch.float64).pin_memory(),
                 "E_dw": torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory(),
                 "E2_dw": torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory(),
+                "EN_dw": torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory(),
                 "numerator": torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory(),
                 "denominator": torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory(),
                 "ravg": torch.empty(comp.target.nneu, dtype=torch.float32).pin_memory(),
@@ -127,6 +128,10 @@ def initialize_storage(file_path, network, n_snapshots):
                     dtype='float32',
                     chunks=(1, comp.target.nneu))
                 comp_grp.create_dataset("E2_dw",
+                    shape=(n_snapshots, comp.target.nneu),
+                    dtype='float32',
+                    chunks=(1, comp.target.nneu))
+                comp_grp.create_dataset("EN_dw",
                     shape=(n_snapshots, comp.target.nneu),
                     dtype='float32',
                     chunks=(1, comp.target.nneu))
